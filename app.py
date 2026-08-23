@@ -1,12 +1,36 @@
 import os
+import json
 import mimetypes
+from datetime import datetime, timezone
 import gradio as gr
 from google import genai
 from google.genai import types
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # --- CONFIGURATION ---
 CLASSIFY_MODEL = "gemini-3.1-flash-lite"
 SOLVE_MODEL = "gemini-3.5-flash"
+
+BQ_PROJECT = "physics-tutoring-504312"
+BQ_DATASET = "bagrut_data"
+BQ_TABLE = "questions"
+
+TOPIC_OPTIONS = [
+    "Kinematics",
+    "Newton's Laws",
+    "Work and Energy",
+    "Momentum and Impulse",
+    "Circular Motion",
+    "Gravitation and Kepler's Laws",
+    "Simple Harmonic Motion",
+    "Torque and Equilibrium",
+    "Electrostatics",
+    "DC Circuits",
+    "Magnetism",
+    "Geometric Optics",
+    "Waves and Sound",
+]
 
 CLASSIFY_PROMPT = """Look at this image. Your ONLY job is to decide: is this a high-school physics problem, diagram, or graph? Do not solve it.
 CRITICAL DISQUALIFIERS (Instant "PHYSICS: no"):
@@ -23,9 +47,14 @@ REQUIRED VISUAL SIGNALS (Must have AT LEAST ONE clear signal to say "yes"):
 - SI unit symbols attached to numbers (in English or Hebrew/Arabic contexts): m/s, m/s², N, kg, Hz, J, W, rad/s, cm, °, V, A, Ω, C, T.
 - Schematic textbook/exam diagrams: Free-body force diagrams (arrows representing F_g, N, f, T), circuit schematics (battery, resistor symbols), inclined planes, pulleys, curved tracks with labeled points (A, B, C), ray-tracing diagrams for lenses/mirrors.
 - Text framing in Hebrew/Arabic/English that presents a formal physics question (e.g., wording like "גוף שמסתו", "כוח", "מהירות", "תנועה מעגלית", "מערכת צירי זמן", "חשב את").
+TOPIC CLASSIFICATION (only if PHYSICS is yes):
+Choose exactly ONE topic from this fixed list that best matches the problem:
+Kinematics, Newton's Laws, Work and Energy, Momentum and Impulse, Circular Motion, Gravitation and Kepler's Laws, Simple Harmonic Motion, Torque and Equilibrium, Electrostatics, DC Circuits, Magnetism, Geometric Optics, Waves and Sound.
+
 FORMAT REQUIREMENT:
 Respond in EXACTLY this format, nothing else:
 PHYSICS: yes or no
+TOPIC: <one topic from the list above, or N/A if PHYSICS is no>
 DESCRIPTION: <one sentence describing what's in the image>
 """
 
@@ -43,6 +72,15 @@ CRITICAL FORMATTING & BEHAVIOR RULES:
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
+# --- BIGQUERY SETUP ---
+try:
+    _sa_info = json.loads(os.environ["GCP_SA_KEY"])
+    _bq_credentials = service_account.Credentials.from_service_account_info(_sa_info)
+    bq_client = bigquery.Client(project=BQ_PROJECT, credentials=_bq_credentials)
+except Exception as e:
+    print(f"[BigQuery] Client init failed, question logging disabled: {e}")
+    bq_client = None
+
 
 # --- HELPER FUNCTIONS ---
 def file_to_part(path: str) -> types.Part:
@@ -54,19 +92,44 @@ def file_to_part(path: str) -> types.Part:
     return types.Part.from_bytes(data=data, mime_type=mime)
 
 
+def log_question_to_bigquery(topic: str, description: str) -> None:
+    """Insert one row into bagrut_data.questions for the teacher dashboard.
+    Never raises - a logging failure must not break the student's session."""
+    if bq_client is None:
+        return
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    row = {
+        "topic": topic,
+        "description": description,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        errors = bq_client.insert_rows_json(table_id, [row])
+        if errors:
+            print(f"[BigQuery] Insert returned errors: {errors}")
+    except Exception as e:
+        print(f"[BigQuery] Insert failed: {e}")
+
+
 def gemini_classify(image_part) -> dict:
     result = client.models.generate_content(
         model=CLASSIFY_MODEL,
         contents=[image_part, CLASSIFY_PROMPT],
     )
     raw_text = result.text
-    parsed = {"physics": False, "description": ""}
+    parsed = {"physics": False, "topic": "N/A", "description": ""}
     for line in raw_text.splitlines():
         line = line.strip()
         if line.upper().startswith("PHYSICS:"):
             parsed["physics"] = "yes" in line.lower()
+        elif line.upper().startswith("TOPIC:"):
+            parsed["topic"] = line.split(":", 1)[1].strip()
         elif line.upper().startswith("DESCRIPTION:"):
             parsed["description"] = line.split(":", 1)[1].strip()
+
+    # Guard against the model returning a topic outside our fixed list
+    if parsed["topic"] not in TOPIC_OPTIONS:
+        parsed["topic"] = "Uncategorized"
     return parsed
 
 
@@ -100,6 +163,8 @@ def handle_message(message, history, chat_session):
                 "content": f"**זו לא נראית שאלת פיזיקה לבגרות.**\n\nתיאור: {classification['description']}"
             })
             return history, clear_value, None
+
+        log_question_to_bigquery(classification["topic"], classification["description"])
 
         chat_session = client.chats.create(
             model=SOLVE_MODEL,
