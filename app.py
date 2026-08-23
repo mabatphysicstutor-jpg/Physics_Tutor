@@ -1,9 +1,6 @@
 import os
-import re
 import mimetypes
 import gradio as gr
-import markdown as md_lib
-import latex2mathml.converter
 from google import genai
 from google.genai import types
 
@@ -48,23 +45,6 @@ client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
 # --- HELPER FUNCTIONS ---
-def latex_to_html_math(text: str) -> str:
-    """Converts $$...$$ and $...$ segments to native MathML."""
-    def convert(match):
-        try:
-            return latex2mathml.converter.convert(match.group(1))
-        except Exception:
-            return match.group(0)
-    text = re.sub(r'\$\$(.+?)\$\$', convert, text, flags=re.DOTALL)
-    text = re.sub(r'\$(.+?)\$', convert, text, flags=re.DOTALL)
-    return text
-
-
-def format_html(text: str) -> str:
-    text = latex_to_html_math(text)
-    return md_lib.markdown(text)
-
-
 def file_to_part(path: str) -> types.Part:
     mime, _ = mimetypes.guess_type(path)
     if not mime:
@@ -135,7 +115,7 @@ def handle_message(message, history, chat_session):
 
         try:
             result = chat_session.send_message([image_part, opening_message])
-            reply = format_html(result.text)
+            reply = result.text
         except Exception as e:
             history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
             return history, clear_value, None
@@ -158,7 +138,7 @@ def handle_message(message, history, chat_session):
 
     try:
         result = chat_session.send_message(text)
-        reply = format_html(result.text)
+        reply = result.text
     except Exception as e:
         reply = f"שגיאה בפנייה ל-Gemini: {str(e)}"
 
@@ -175,15 +155,19 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
     chatbot = gr.Chatbot(
         label="Tutor",
         rtl=True,
-        sanitize_html=False,   # allow our generated HTML/MathML to render instead of being escaped
+        sanitize_html=False,
         height=500,
+        latex_delimiters=[
+            {"left": "$$", "right": "$$", "display": True},
+            {"left": "$", "right": "$", "display": False},
+        ],
     )
 
     msg_box = gr.MultimodalTextbox(
         label="",
-        placeholder="כתבו שאלה או צרפו/הדביקו תמונה של בעיה...",
+        placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
         file_types=["image"],
-        sources=["upload", "clipboard"],
+        sources=["upload"],
         rtl=True,
     )
 
