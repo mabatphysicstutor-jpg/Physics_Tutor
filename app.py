@@ -2,6 +2,7 @@ import os
 import json
 import mimetypes
 from datetime import datetime, timezone
+
 import gradio as gr
 from google import genai
 from google.genai import types
@@ -32,6 +33,24 @@ TOPIC_OPTIONS = [
     "Waves and Sound",
 ]
 
+# English topic label (as stored in BigQuery) -> Hebrew label (shown to teachers)
+TOPIC_HEBREW = {
+    "Kinematics": "קינמטיקה",
+    "Newton's Laws": "חוקי ניוטון",
+    "Work and Energy": "עבודה ואנרגיה",
+    "Momentum and Impulse": "תנע ואיפולס",
+    "Circular Motion": "תנועה מעגלית",
+    "Gravitation and Kepler's Laws": "כבידה וחוקי קפלר",
+    "Simple Harmonic Motion": "תנועה הרמונית פשוטה",
+    "Torque and Equilibrium": "מומנט ושיווי משקל",
+    "Electrostatics": "אלקטרוסטטיקה",
+    "DC Circuits": "מעגלי זרם ישר",
+    "Magnetism": "מגנטיות",
+    "Geometric Optics": "אופטיקה גאומטרית",
+    "Waves and Sound": "גלים וקול",
+    "Uncategorized": "לא מסווג",
+}
+
 CLASSIFY_PROMPT = """Look at this image. Your ONLY job is to decide: is this a high-school physics problem, diagram, or graph? Do not solve it.
 CRITICAL DISQUALIFIERS (Instant "PHYSICS: no"):
 - Any image featuring animals (unicorns, horses, cats, dogs, etc.), fantasy creatures, natural landscapes, portraits, or clip-art illustration WITHOUT explicit physics annotations overlaying it.
@@ -50,7 +69,6 @@ REQUIRED VISUAL SIGNALS (Must have AT LEAST ONE clear signal to say "yes"):
 TOPIC CLASSIFICATION (only if PHYSICS is yes):
 Choose exactly ONE topic from this fixed list that best matches the problem:
 Kinematics, Newton's Laws, Work and Energy, Momentum and Impulse, Circular Motion, Gravitation and Kepler's Laws, Simple Harmonic Motion, Torque and Equilibrium, Electrostatics, DC Circuits, Magnetism, Geometric Optics, Waves and Sound.
-
 FORMAT REQUIREMENT:
 Respond in EXACTLY this format, nothing else:
 PHYSICS: yes or no
@@ -58,8 +76,7 @@ TOPIC: <one topic from the list above, or N/A if PHYSICS is no>
 DESCRIPTION: <one sentence describing what's in the image>
 """
 
-SOCRATIC_SYSTEM_PROMPT = """
-You are an encouraging, highly expert high school physics private tutor for Israeli students.
+SOCRATIC_SYSTEM_PROMPT = """You are an encouraging, highly expert high school physics private tutor for Israeli students.
 Your primary goal is NOT to solve the problem directly, but to guide the student step-by-step using the Socratic method.
 CRITICAL FORMATTING & BEHAVIOR RULES:
 1. MAX LENGTH: Keep your response strictly under 1 short paragraph (3-4 sentences maximum).
@@ -126,14 +143,37 @@ def gemini_classify(image_part) -> dict:
             parsed["topic"] = line.split(":", 1)[1].strip()
         elif line.upper().startswith("DESCRIPTION:"):
             parsed["description"] = line.split(":", 1)[1].strip()
-
     # Guard against the model returning a topic outside our fixed list
     if parsed["topic"] not in TOPIC_OPTIONS:
         parsed["topic"] = "Uncategorized"
     return parsed
 
 
-# --- CHAT PIPELINE ---
+def get_topic_stats():
+    """Query BigQuery for per-topic question counts, translated to Hebrew.
+    Returns a list of [hebrew_topic, count] rows, sorted descending by count."""
+    if bq_client is None:
+        return [["שגיאה: אין חיבור ל-BigQuery", 0]]
+
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    query = f"""
+        SELECT topic, COUNT(*) AS count
+        FROM `{table_id}`
+        GROUP BY topic
+        ORDER BY count DESC
+    """
+    try:
+        results = bq_client.query(query).result()
+        rows = [[TOPIC_HEBREW.get(r.topic, r.topic), r.count] for r in results]
+        if not rows:
+            return [["אין נתונים עדיין", 0]]
+        return rows
+    except Exception as e:
+        print(f"[BigQuery] Stats query failed: {e}")
+        return [[f"שגיאה בשליפת נתונים: {str(e)}", 0]]
+
+
+# --- CHAT PIPELINE (student side) ---
 def handle_message(message, history, chat_session):
     """Single entry point for the unified chat box.
     `message` is a dict from MultimodalTextbox: {"text": str, "files": [paths]}."""
@@ -177,7 +217,6 @@ def handle_message(message, history, chat_session):
         )
 
         opening_message = text if text else "שלום, אני צריך עזרה להתחיל לפתור את השאלה הזו."
-
         try:
             result = chat_session.send_message([image_part, opening_message])
             reply = result.text
@@ -213,33 +252,93 @@ def handle_message(message, history, chat_session):
 
 # --- UI ---
 with gr.Blocks(title="Bagrut Physics Tutor") as demo:
-    gr.Markdown("## מורה פרטי לפיזיקה - בגרות")
 
-    chat_session_state = gr.State(None)
+    # --- Page 1: role selection ---
+    with gr.Column(visible=True) as role_page:
+        gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+        gr.Markdown("### מי אתה?", rtl=True)
+        with gr.Row():
+            student_btn = gr.Button("👨‍🎓 אני תלמיד/ה", variant="primary", size="lg")
+            teacher_btn = gr.Button("👩‍🏫 אני מורה", variant="secondary", size="lg")
 
-    chatbot = gr.Chatbot(
-        label="Tutor",
-        rtl=True,
-        sanitize_html=False,
-        height=500,
-        latex_delimiters=[
-            {"left": "$$", "right": "$$", "display": True},
-            {"left": "$", "right": "$", "display": False},
-        ],
+    # --- Page 2: student chat interface ---
+    with gr.Column(visible=False) as student_page:
+        student_back_btn = gr.Button("⬅ חזרה", size="sm")
+        gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+
+        chat_session_state = gr.State(None)
+
+        chatbot = gr.Chatbot(
+            label="Tutor",
+            rtl=True,
+            sanitize_html=False,
+            height=500,
+            latex_delimiters=[
+                {"left": "$$", "right": "$$", "display": True},
+                {"left": "$", "right": "$", "display": False},
+            ],
+        )
+
+        msg_box = gr.MultimodalTextbox(
+            label="",
+            placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
+            file_types=["image"],
+            sources=["upload"],
+            rtl=True,
+        )
+
+        msg_box.submit(
+            fn=handle_message,
+            inputs=[msg_box, chatbot, chat_session_state],
+            outputs=[chatbot, msg_box, chat_session_state],
+        )
+
+    # --- Page 3: teacher dashboard ---
+    with gr.Column(visible=False) as teacher_page:
+        teacher_back_btn = gr.Button("⬅ חזרה", size="sm")
+        gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
+
+        refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
+
+        stats_table = gr.Dataframe(
+            headers=["נושא", "מספר שאלות"],
+            datatype=["str", "number"],
+            row_count=(0, "dynamic"),
+            column_count=(2, "fixed"),
+            interactive=False,
+        )
+
+        stats_plot = gr.BarPlot(
+            x="נושא",
+            y="מספר שאלות",
+            title="התפלגות שאלות לפי נושא",
+        )
+
+        def refresh_stats():
+            rows = get_topic_stats()
+            import pandas as pd
+            df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
+            return df, df
+
+        refresh_btn.click(fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot])
+
+    # --- Navigation wiring ---
+    def go_to_student():
+        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+
+    def go_to_teacher():
+        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+
+    def go_to_role():
+        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+
+    student_btn.click(fn=go_to_student, inputs=None, outputs=[role_page, student_page, teacher_page])
+    teacher_btn.click(
+        fn=go_to_teacher, inputs=None, outputs=[role_page, student_page, teacher_page]
+    ).then(
+        fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
     )
-
-    msg_box = gr.MultimodalTextbox(
-        label="",
-        placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
-        file_types=["image"],
-        sources=["upload"],
-        rtl=True,
-    )
-
-    msg_box.submit(
-        fn=handle_message,
-        inputs=[msg_box, chatbot, chat_session_state],
-        outputs=[chatbot, msg_box, chat_session_state],
-    )
+    student_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
+    teacher_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
 
 demo.launch()
