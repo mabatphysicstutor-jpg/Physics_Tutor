@@ -1,7 +1,9 @@
 import os
 import json
+import uuid
 import mimetypes
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import gradio as gr
 from google import genai
@@ -16,6 +18,10 @@ SOLVE_MODEL = "gemini-3.5-flash"
 BQ_PROJECT = "physics-tutoring-504312"
 BQ_DATASET = "bagrut_data"
 BQ_TABLE = "questions"
+BQ_CONV_TABLE = "conversations"
+
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "princecanute")
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 TOPIC_OPTIONS = [
     "Kinematics",
@@ -110,7 +116,7 @@ def file_to_part(path: str) -> types.Part:
 
 
 def log_question_to_bigquery(topic: str, description: str) -> None:
-    """Insert one row into bagrut_data.questions for the teacher dashboard.
+    """Insert one row into bagrut_data.questions for the teacher dashboard stats.
     Never raises - a logging failure must not break the student's session."""
     if bq_client is None:
         return
@@ -126,6 +132,27 @@ def log_question_to_bigquery(topic: str, description: str) -> None:
             print(f"[BigQuery] Insert returned errors: {errors}")
     except Exception as e:
         print(f"[BigQuery] Insert failed: {e}")
+
+
+def log_conversation_turn(session_id: str, topic: str, role: str, message: str) -> None:
+    """Insert one turn (student question or tutor reply) into bagrut_data.conversations.
+    Never raises - a logging failure must not break the student's session."""
+    if bq_client is None or not session_id:
+        return
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
+    row = {
+        "session_id": session_id,
+        "topic": topic,
+        "role": role,
+        "message": message,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        errors = bq_client.insert_rows_json(table_id, [row])
+        if errors:
+            print(f"[BigQuery] Conversation insert returned errors: {errors}")
+    except Exception as e:
+        print(f"[BigQuery] Conversation insert failed: {e}")
 
 
 def gemini_classify(image_part) -> dict:
@@ -173,10 +200,68 @@ def get_topic_stats():
         return [[f"שגיאה בשליפת נתונים: {str(e)}", 0]]
 
 
+def get_sessions_list():
+    """Query BigQuery for distinct chat sessions, most recent first.
+    Returns choices for a gr.Dropdown: list of (label, session_id) tuples."""
+    if bq_client is None:
+        return []
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
+    query = f"""
+        SELECT session_id, ANY_VALUE(topic) AS topic, MIN(created_at) AS started_at
+        FROM `{table_id}`
+        GROUP BY session_id
+        ORDER BY started_at DESC
+        LIMIT 200
+    """
+    try:
+        results = bq_client.query(query).result()
+        choices = []
+        for r in results:
+            topic_he = TOPIC_HEBREW.get(r.topic, r.topic)
+            ts = r.started_at.astimezone(ISRAEL_TZ).strftime("%d/%m %H:%M")
+            label = f"{ts} - {topic_he}"
+            choices.append((label, r.session_id))
+        return choices
+    except Exception as e:
+        print(f"[BigQuery] Sessions query failed: {e}")
+        return []
+
+
+def get_conversation_dialog(session_id):
+    """Fetch every turn for one session_id, ordered by time.
+    Returns a list of {"role", "content"} dicts, ready for gr.Chatbot."""
+    if bq_client is None or not session_id:
+        return []
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
+    query = f"""
+        SELECT role, message, created_at
+        FROM `{table_id}`
+        WHERE session_id = @session_id
+        ORDER BY created_at ASC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("session_id", "STRING", session_id)]
+    )
+    try:
+        results = bq_client.query(query, job_config=job_config).result()
+        dialog = [{"role": r.role, "content": r.message} for r in results]
+        return dialog
+    except Exception as e:
+        print(f"[BigQuery] Dialog query failed: {e}")
+        return []
+
+
+def refresh_sessions():
+    """Repopulate the sessions dropdown and clear the old dialog view."""
+    choices = get_sessions_list()
+    return gr.update(choices=choices, value=None), []
+
+
 # --- CHAT PIPELINE (student side) ---
-def handle_message(message, history, chat_session):
+def handle_message(message, history, session_state):
     """Single entry point for the unified chat box.
-    `message` is a dict from MultimodalTextbox: {"text": str, "files": [paths]}."""
+    `message` is a dict from MultimodalTextbox: {"text": str, "files": [paths]}.
+    `session_state` holds {"chat": genai chat session, "session_id": str, "topic": str}."""
     history = history or []
     text = (message.get("text") or "").strip()
     files = message.get("files") or []
@@ -195,16 +280,18 @@ def handle_message(message, history, chat_session):
             classification = gemini_classify(image_part)
         except Exception as e:
             history.append({"role": "assistant", "content": f"שגיאה בסיווג התמונה: {str(e)}"})
-            return history, clear_value, None
+            return history, clear_value, session_state
 
         if not classification["physics"]:
             history.append({
                 "role": "assistant",
                 "content": f"**זו לא נראית שאלת פיזיקה לבגרות.**\n\nתיאור: {classification['description']}"
             })
-            return history, clear_value, None
+            return history, clear_value, session_state
 
-        log_question_to_bigquery(classification["topic"], classification["description"])
+        topic = classification["topic"]
+        session_id = str(uuid.uuid4())
+        log_question_to_bigquery(topic, classification["description"])
 
         chat_session = client.chats.create(
             model=SOLVE_MODEL,
@@ -217,128 +304,223 @@ def handle_message(message, history, chat_session):
         )
 
         opening_message = text if text else "שלום, אני צריך עזרה להתחיל לפתור את השאלה הזו."
+        log_conversation_turn(session_id, topic, "user", opening_message)
         try:
             result = chat_session.send_message([image_part, opening_message])
             reply = result.text
         except Exception as e:
             history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
-            return history, clear_value, None
+            return history, clear_value, session_state
 
+        log_conversation_turn(session_id, topic, "assistant", reply)
         history.append({"role": "assistant", "content": reply})
-        return history, clear_value, chat_session
+        session_state = {"chat": chat_session, "session_id": session_id, "topic": topic}
+        return history, clear_value, session_state
 
     # --- Case 2: plain text follow-up, no image ---
     if not text:
-        return history, clear_value, chat_session
+        return history, clear_value, session_state
 
     history.append({"role": "user", "content": text})
 
-    if chat_session is None:
+    if session_state is None:
         history.append({
             "role": "assistant",
             "content": "כדי להתחיל, צריך להעלות תמונה של שאלת פיזיקה 📎"
         })
-        return history, clear_value, chat_session
+        return history, clear_value, session_state
 
+    chat_session = session_state["chat"]
+    log_conversation_turn(session_state["session_id"], session_state["topic"], "user", text)
     try:
         result = chat_session.send_message(text)
         reply = result.text
     except Exception as e:
         reply = f"שגיאה בפנייה ל-Gemini: {str(e)}"
 
+    log_conversation_turn(session_state["session_id"], session_state["topic"], "assistant", reply)
     history.append({"role": "assistant", "content": reply})
-    return history, clear_value, chat_session
+    return history, clear_value, session_state
 
 
 # --- UI ---
+CUSTOM_CSS = """
+#main-wrap {
+    max-width: 700px !important;
+    margin: 40px auto !important;
+}
+#role-page h1 {
+    font-size: 2.4rem !important;
+}
+#role-page h2 {
+    font-size: 1.6rem !important;
+    margin-bottom: 16px !important;
+}
+#role-page .role-btn {
+    font-size: 1.3rem !important;
+    padding: 28px 20px !important;
+    height: auto !important;
+}
+"""
+
 with gr.Blocks(title="Bagrut Physics Tutor") as demo:
 
-    # --- Page 1: role selection ---
-    with gr.Column(visible=True) as role_page:
-        gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
-        gr.Markdown("### מי אתה?", rtl=True)
-        with gr.Row():
-            student_btn = gr.Button("👨‍🎓 אני תלמיד/ה", variant="primary", size="lg")
-            teacher_btn = gr.Button("👩‍🏫 אני מורה", variant="secondary", size="lg")
+    with gr.Column(elem_id="main-wrap"):
 
-    # --- Page 2: student chat interface ---
-    with gr.Column(visible=False) as student_page:
-        student_back_btn = gr.Button("⬅ חזרה", size="sm")
-        gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+        # --- Page 0: password gate ---
+        with gr.Column(visible=True) as password_page:
+            gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+            gr.Markdown("### נא להזין סיסמה כדי להיכנס", rtl=True)
+            password_box = gr.Textbox(
+                label="סיסמה",
+                type="password",
+                rtl=True,
+            )
+            password_error = gr.Markdown("", rtl=True)
+            password_submit_btn = gr.Button("כניסה", variant="primary")
 
-        chat_session_state = gr.State(None)
+        # --- Page 1: role selection ---
+        with gr.Column(visible=False, elem_id="role-page") as role_page:
+            gr.Markdown("# מורה פרטי לפיזיקה - בגרות", rtl=True)
+            gr.Markdown("## מי אתה?", rtl=True)
+            with gr.Row():
+                student_btn = gr.Button("👨‍🎓 אני תלמיד/ה", variant="primary", size="lg", elem_classes="role-btn")
+                teacher_btn = gr.Button("👩‍🏫 אני מורה", variant="secondary", size="lg", elem_classes="role-btn")
 
-        chatbot = gr.Chatbot(
-            label="Tutor",
-            rtl=True,
-            sanitize_html=False,
-            height=500,
-            latex_delimiters=[
-                {"left": "$$", "right": "$$", "display": True},
-                {"left": "$", "right": "$", "display": False},
-            ],
+        # --- Page 2: student chat interface ---
+        with gr.Column(visible=False) as student_page:
+            student_back_btn = gr.Button("⬅ חזרה", size="sm")
+            gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+
+            session_state = gr.State(None)
+
+            chatbot = gr.Chatbot(
+                label="Tutor",
+                rtl=True,
+                sanitize_html=False,
+                height=500,
+                latex_delimiters=[
+                    {"left": "$$", "right": "$$", "display": True},
+                    {"left": "$", "right": "$", "display": False},
+                ],
+            )
+
+            msg_box = gr.MultimodalTextbox(
+                label="",
+                placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
+                file_types=["image"],
+                sources=["upload"],
+                rtl=True,
+            )
+
+            msg_box.submit(
+                fn=handle_message,
+                inputs=[msg_box, chatbot, session_state],
+                outputs=[chatbot, msg_box, session_state],
+            )
+
+        # --- Page 3: teacher dashboard ---
+        with gr.Column(visible=False) as teacher_page:
+            teacher_back_btn = gr.Button("⬅ חזרה", size="lg")
+            gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
+
+            refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
+
+            stats_table = gr.Dataframe(
+                headers=["נושא", "מספר שאלות"],
+                datatype=["str", "number"],
+                row_count=(0, "dynamic"),
+                column_count=(2, "fixed"),
+                interactive=False,
+            )
+
+            stats_plot = gr.BarPlot(
+                x="נושא",
+                y="מספר שאלות",
+                title="התפלגות שאלות לפי נושא",
+                y_lim=(0, 10),
+            )
+
+            gr.Markdown("### שיחות תלמידים", rtl=True)
+
+            sessions_dropdown = gr.Dropdown(
+                label="בחר/י שיחה לצפייה",
+                choices=[],
+            )
+
+            dialog_view = gr.Chatbot(
+                label="תמלול השיחה",
+                rtl=True,
+                height=450,
+                sanitize_html=False,
+                latex_delimiters=[
+                    {"left": "$$", "right": "$$", "display": True},
+                    {"left": "$", "right": "$", "display": False},
+                ],
+            )
+
+            def refresh_stats():
+                rows = get_topic_stats()
+                import pandas as pd
+                df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
+                max_count = df["מספר שאלות"].max() if not df.empty else 0
+                upper = max(int(max_count * 1.2), 5)
+                plot_update = gr.BarPlot(
+                    x="נושא",
+                    y="מספר שאלות",
+                    title="התפלגות שאלות לפי נושא",
+                    y_lim=(0, upper),
+                    value=df,
+                )
+                return df, plot_update
+
+            refresh_btn.click(
+                fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
+            ).then(
+                fn=refresh_sessions, inputs=None, outputs=[sessions_dropdown, dialog_view]
+            )
+
+            sessions_dropdown.change(
+                fn=get_conversation_dialog,
+                inputs=[sessions_dropdown],
+                outputs=[dialog_view],
+            )
+
+        # --- Navigation wiring ---
+        def check_password(entered_password):
+            if entered_password == APP_PASSWORD:
+                return gr.update(visible=False), gr.update(visible=True), ""
+            return gr.update(visible=True), gr.update(visible=False), "**סיסמה שגויה, נסה/י שוב.**"
+
+        def go_to_student():
+            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+
+        def go_to_teacher():
+            return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+
+        def go_to_role():
+            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+
+        password_submit_btn.click(
+            fn=check_password,
+            inputs=[password_box],
+            outputs=[password_page, role_page, password_error],
+        )
+        password_box.submit(
+            fn=check_password,
+            inputs=[password_box],
+            outputs=[password_page, role_page, password_error],
         )
 
-        msg_box = gr.MultimodalTextbox(
-            label="",
-            placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
-            file_types=["image"],
-            sources=["upload"],
-            rtl=True,
+        student_btn.click(fn=go_to_student, inputs=None, outputs=[role_page, student_page, teacher_page])
+        teacher_btn.click(
+            fn=go_to_teacher, inputs=None, outputs=[role_page, student_page, teacher_page]
+        ).then(
+            fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
+        ).then(
+            fn=refresh_sessions, inputs=None, outputs=[sessions_dropdown, dialog_view]
         )
+        student_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
+        teacher_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
 
-        msg_box.submit(
-            fn=handle_message,
-            inputs=[msg_box, chatbot, chat_session_state],
-            outputs=[chatbot, msg_box, chat_session_state],
-        )
-
-    # --- Page 3: teacher dashboard ---
-    with gr.Column(visible=False) as teacher_page:
-        teacher_back_btn = gr.Button("⬅ חזרה", size="sm")
-        gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
-
-        refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
-
-        stats_table = gr.Dataframe(
-            headers=["נושא", "מספר שאלות"],
-            datatype=["str", "number"],
-            row_count=(0, "dynamic"),
-            column_count=(2, "fixed"),
-            interactive=False,
-        )
-
-        stats_plot = gr.BarPlot(
-            x="נושא",
-            y="מספר שאלות",
-            title="התפלגות שאלות לפי נושא",
-        )
-
-        def refresh_stats():
-            rows = get_topic_stats()
-            import pandas as pd
-            df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
-            return df, df
-
-        refresh_btn.click(fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot])
-
-    # --- Navigation wiring ---
-    def go_to_student():
-        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-
-    def go_to_teacher():
-        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
-
-    def go_to_role():
-        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
-
-    student_btn.click(fn=go_to_student, inputs=None, outputs=[role_page, student_page, teacher_page])
-    teacher_btn.click(
-        fn=go_to_teacher, inputs=None, outputs=[role_page, student_page, teacher_page]
-    ).then(
-        fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
-    )
-    student_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
-    teacher_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
-
-demo.launch()
+demo.launch(css=CUSTOM_CSS)
