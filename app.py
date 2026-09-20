@@ -6,22 +6,48 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import gradio as gr
+import pandas as pd
 from google import genai
 from google.genai import types
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # --- CONFIGURATION ---
-CLASSIFY_MODEL = "gemini-3.1-flash-lite"
-SOLVE_MODEL = "gemini-3.5-flash"
+CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "gemini-3.1-flash-lite")
+SOLVE_MODEL = os.getenv("SOLVE_MODEL", "gemini-3.5-flash")
 
-BQ_PROJECT = "physics-tutoring-504312"
+BQ_PROJECT = os.getenv("BQ_PROJECT", "physics-tutoring-504312")
 BQ_DATASET = "bagrut_data"
 BQ_TABLE = "questions"
 BQ_CONV_TABLE = "conversations"
 
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "princecanute")
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+
+# --- LOAD PASSWORDS FROM HUGGING FACE SECRET ---
+passwords_json = os.getenv("APP_PASSWORDS", "").strip()
+
+if passwords_json:
+    try:
+        PASSWORDS = json.loads(passwords_json)
+        print(f"[Config] Successfully loaded {len(PASSWORDS)} user passwords from APP_PASSWORDS secret.")
+    except Exception as e:
+        print(f"[Config Error] Failed to parse APP_PASSWORDS secret: {e}")
+        PASSWORDS = {}
+else:
+    print("[Config Warning] APP_PASSWORDS secret missing or empty. Falling back to default testing accounts.")
+    PASSWORDS = {
+        "eitanstudent": {"role": "student", "school": "eitan"},
+        "eitanteacher": {"role": "teacher", "school": "eitan"},
+        "regularstudent": {"role": "student", "school": None},
+    }
+
+SCHOOL_HEBREW = {
+    "eitan": "איתן",
+    None: "ללא שיוך לבית ספר",
+}
+
+SCOPE_MY_SCHOOL = "בית הספר שלי"
+SCOPE_ALL_SCHOOLS = "כל בתי הספר"
 
 TOPIC_OPTIONS = [
     "Kinematics",
@@ -39,7 +65,6 @@ TOPIC_OPTIONS = [
     "Waves and Sound",
 ]
 
-# English topic label (as stored in BigQuery) -> Hebrew label (shown to teachers)
 TOPIC_HEBREW = {
     "Kinematics": "קינמטיקה",
     "Newton's Laws": "חוקי ניוטון",
@@ -93,7 +118,9 @@ CRITICAL FORMATTING & BEHAVIOR RULES:
 6. CONTINUITY: This is an ongoing conversation. Use the student's previous replies to decide what to ask next — don't repeat a question you already asked.
 """
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# --- GEMINI CLIENT SETUP ---
+api_key = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=api_key) if api_key else None
 
 # --- BIGQUERY SETUP ---
 try:
@@ -115,15 +142,14 @@ def file_to_part(path: str) -> types.Part:
     return types.Part.from_bytes(data=data, mime_type=mime)
 
 
-def log_question_to_bigquery(topic: str, description: str) -> None:
-    """Insert one row into bagrut_data.questions for the teacher dashboard stats.
-    Never raises - a logging failure must not break the student's session."""
+def log_question_to_bigquery(topic: str, description: str, school) -> None:
     if bq_client is None:
         return
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
     row = {
         "topic": topic,
         "description": description,
+        "school": school,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -134,9 +160,7 @@ def log_question_to_bigquery(topic: str, description: str) -> None:
         print(f"[BigQuery] Insert failed: {e}")
 
 
-def log_conversation_turn(session_id: str, topic: str, role: str, message: str) -> None:
-    """Insert one turn (student question or tutor reply) into bagrut_data.conversations.
-    Never raises - a logging failure must not break the student's session."""
+def log_conversation_turn(session_id: str, topic: str, role: str, message: str, school) -> None:
     if bq_client is None or not session_id:
         return
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
@@ -145,6 +169,7 @@ def log_conversation_turn(session_id: str, topic: str, role: str, message: str) 
         "topic": topic,
         "role": role,
         "message": message,
+        "school": school,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -156,6 +181,8 @@ def log_conversation_turn(session_id: str, topic: str, role: str, message: str) 
 
 
 def gemini_classify(image_part) -> dict:
+    if not client:
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
     result = client.models.generate_content(
         model=CLASSIFY_MODEL,
         contents=[image_part, CLASSIFY_PROMPT],
@@ -170,51 +197,63 @@ def gemini_classify(image_part) -> dict:
             parsed["topic"] = line.split(":", 1)[1].strip()
         elif line.upper().startswith("DESCRIPTION:"):
             parsed["description"] = line.split(":", 1)[1].strip()
-    # Guard against the model returning a topic outside our fixed list
     if parsed["topic"] not in TOPIC_OPTIONS:
         parsed["topic"] = "Uncategorized"
     return parsed
 
 
-def get_topic_stats():
-    """Query BigQuery for per-topic question counts, translated to Hebrew.
-    Returns a list of [hebrew_topic, count] rows, sorted descending by count."""
+def get_topic_stats(school_filter=None):
+    """Returns a dict of {english_topic: count}, or None on query failure.
+    Deliberately has NO ORDER BY — row order from BigQuery is never relied
+    upon. Category ordering for display is handled entirely in
+    auto_refresh_dashboard so the chart's x-axis order is fixed and
+    identical across every scope/refresh, instead of shifting with
+    count-based ranking (which was causing bars and labels to drift out of
+    sync when switching between school scopes)."""
     if bq_client is None:
-        return [["שגיאה: אין חיבור ל-BigQuery", 0]]
+        return None
 
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    where_clause = "WHERE school = @school" if school_filter else ""
     query = f"""
         SELECT topic, COUNT(*) AS count
         FROM `{table_id}`
+        {where_clause}
         GROUP BY topic
-        ORDER BY count DESC
     """
+    job_config = None
+    if school_filter:
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("school", "STRING", school_filter)]
+        )
     try:
-        results = bq_client.query(query).result()
-        rows = [[TOPIC_HEBREW.get(r.topic, r.topic), r.count] for r in results]
-        if not rows:
-            return [["אין נתונים עדיין", 0]]
-        return rows
+        results = bq_client.query(query, job_config=job_config).result()
+        return {r.topic: int(r.count) for r in results}
     except Exception as e:
         print(f"[BigQuery] Stats query failed: {e}")
-        return [[f"שגיאה בשליפת נתונים: {str(e)}", 0]]
+        return None
 
 
-def get_sessions_list():
-    """Query BigQuery for distinct chat sessions, most recent first.
-    Returns choices for a gr.Dropdown: list of (label, session_id) tuples."""
+def get_sessions_list(school_filter=None):
     if bq_client is None:
         return []
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
+    where_clause = "WHERE school = @school" if school_filter else ""
     query = f"""
         SELECT session_id, ANY_VALUE(topic) AS topic, MIN(created_at) AS started_at
         FROM `{table_id}`
+        {where_clause}
         GROUP BY session_id
         ORDER BY started_at DESC
         LIMIT 200
     """
+    job_config = None
+    if school_filter:
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("school", "STRING", school_filter)]
+        )
     try:
-        results = bq_client.query(query).result()
+        results = bq_client.query(query, job_config=job_config).result()
         choices = []
         for r in results:
             topic_he = TOPIC_HEBREW.get(r.topic, r.topic)
@@ -228,8 +267,6 @@ def get_sessions_list():
 
 
 def get_conversation_dialog(session_id):
-    """Fetch every turn for one session_id, ordered by time.
-    Returns a list of {"role", "content"} dicts, ready for gr.Chatbot."""
     if bq_client is None or not session_id:
         return []
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
@@ -251,23 +288,112 @@ def get_conversation_dialog(session_id):
         return []
 
 
-def refresh_sessions():
-    """Repopulate the sessions dropdown and clear the old dialog view."""
-    choices = get_sessions_list()
-    return gr.update(choices=choices, value=None), []
+# --- AUTO-REFRESH DASHBOARD ---
+def auto_refresh_dashboard(scope, user_school):
+    """
+    Explicitly determines the school filter based on scope:
+    - If scope is 'כל בתי הספר', explicitly set school_filter to None.
+    - If scope is 'בית הספר שלי', set school_filter to the teacher's user_school.
+    """
+    if scope == SCOPE_ALL_SCHOOLS:
+        school_filter = None
+    else:
+        school_filter = user_school
+
+    counts = get_topic_stats(school_filter)
+
+    if counts is None:
+        df = pd.DataFrame({"נושא": [], "מספר שאלות": []})
+        upper = 5
+        hebrew_order = []
+    else:
+        # Fixed, deterministic topic order — identical on every render,
+        # regardless of scope or which topics currently have zero questions.
+        # Topics with no questions yet are zero-filled rather than dropped.
+        # Any topic BigQuery returns that isn't in TOPIC_OPTIONS (e.g.
+        # "Uncategorized") is appended at the end, in first-seen order.
+        ordered_topics = list(TOPIC_OPTIONS)
+        for t in counts:
+            if t not in ordered_topics:
+                ordered_topics.append(t)
+
+        rows = [[TOPIC_HEBREW.get(t, t), counts.get(t, 0)] for t in ordered_topics]
+        df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
+        df["מספר שאלות"] = pd.to_numeric(df["מספר שאלות"], errors="coerce").fillna(0).astype(int)
+        max_count = df["מספר שאלות"].max() if not df.empty else 0
+        upper = max(int(max_count * 1.2), 5)
+        hebrew_order = df["נושא"].tolist()
+
+    plot_update = gr.BarPlot(
+        value=df,
+        x="נושא",
+        y="מספר שאלות",
+        title="התפלגות שאלות לפי נושא",
+        y_lim=(0, upper),
+        # Pin the x-axis to our fixed order explicitly — without this,
+        # Vega-Lite is free to re-sort a nominal axis on its own, which is
+        # what let the bars and labels drift out of sync between scopes.
+        sort=hebrew_order if hebrew_order else None,
+    )
+
+    choices = get_sessions_list(school_filter)
+    dropdown_update = gr.update(choices=choices, value=None)
+    dialog_update = []
+
+    return df, plot_update, dropdown_update, dialog_update
 
 
-# --- CHAT PIPELINE (student side) ---
-def handle_message(message, history, session_state):
-    """Single entry point for the unified chat box.
-    `message` is a dict from MultimodalTextbox: {"text": str, "files": [paths]}.
-    `session_state` holds {"chat": genai chat session, "session_id": str, "topic": str}."""
+# --- LOGIN AND ATOMIC LOAD ---
+def check_password_and_load(entered_password, scope):
+    clean_password = (entered_password or "").strip()
+    entry = PASSWORDS.get(clean_password)
+
+    if entry is None:
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            "**סיסמה שגויה, נסה/י שוב.**",
+            None,
+            gr.update(), gr.update(), gr.update(), gr.update()
+        )
+
+    school = entry["school"]
+
+    if entry["role"] == "student":
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            "",
+            school,
+            gr.update(), gr.update(), gr.update(), gr.update()
+        )
+
+    # Teacher login: fetch and return refreshed dashboard components directly
+    df, plot_update, dropdown_update, dialog_update = auto_refresh_dashboard(scope, school)
+
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=True),
+        "",
+        school,
+        df, plot_update, dropdown_update, dialog_update
+    )
+
+
+def go_to_login():
+    return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), None
+
+
+# --- CHAT PIPELINE ---
+def handle_message(message, history, session_state, user_school):
     history = history or []
     text = (message.get("text") or "").strip()
     files = message.get("files") or []
     clear_value = {"text": "", "files": []}
 
-    # --- Case 1: an image was attached -> start a fresh problem ---
     if files:
         image_path = files[0]
         history.append({"role": "user", "content": {"path": image_path}})
@@ -291,7 +417,11 @@ def handle_message(message, history, session_state):
 
         topic = classification["topic"]
         session_id = str(uuid.uuid4())
-        log_question_to_bigquery(topic, classification["description"])
+        log_question_to_bigquery(topic, classification["description"], user_school)
+
+        if not client:
+            history.append({"role": "assistant", "content": "שגיאה: GEMINI_API_KEY אינו מוגדר."})
+            return history, clear_value, session_state
 
         chat_session = client.chats.create(
             model=SOLVE_MODEL,
@@ -304,7 +434,7 @@ def handle_message(message, history, session_state):
         )
 
         opening_message = text if text else "שלום, אני צריך עזרה להתחיל לפתור את השאלה הזו."
-        log_conversation_turn(session_id, topic, "user", opening_message)
+        log_conversation_turn(session_id, topic, "user", opening_message, user_school)
         try:
             result = chat_session.send_message([image_part, opening_message])
             reply = result.text
@@ -312,12 +442,11 @@ def handle_message(message, history, session_state):
             history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
             return history, clear_value, session_state
 
-        log_conversation_turn(session_id, topic, "assistant", reply)
+        log_conversation_turn(session_id, topic, "assistant", reply, user_school)
         history.append({"role": "assistant", "content": reply})
         session_state = {"chat": chat_session, "session_id": session_id, "topic": topic}
         return history, clear_value, session_state
 
-    # --- Case 2: plain text follow-up, no image ---
     if not text:
         return history, clear_value, session_state
 
@@ -331,35 +460,23 @@ def handle_message(message, history, session_state):
         return history, clear_value, session_state
 
     chat_session = session_state["chat"]
-    log_conversation_turn(session_state["session_id"], session_state["topic"], "user", text)
+    log_conversation_turn(session_state["session_id"], session_state["topic"], "user", text, user_school)
     try:
         result = chat_session.send_message(text)
         reply = result.text
     except Exception as e:
         reply = f"שגיאה בפנייה ל-Gemini: {str(e)}"
 
-    log_conversation_turn(session_state["session_id"], session_state["topic"], "assistant", reply)
+    log_conversation_turn(session_state["session_id"], session_state["topic"], "assistant", reply, user_school)
     history.append({"role": "assistant", "content": reply})
     return history, clear_value, session_state
 
 
-# --- UI ---
+# --- UI CONSTRUCTION ---
 CUSTOM_CSS = """
 #main-wrap {
     max-width: 700px !important;
     margin: 40px auto !important;
-}
-#role-page h1 {
-    font-size: 2.4rem !important;
-}
-#role-page h2 {
-    font-size: 1.6rem !important;
-    margin-bottom: 16px !important;
-}
-#role-page .role-btn {
-    font-size: 1.3rem !important;
-    padding: 28px 20px !important;
-    height: auto !important;
 }
 """
 
@@ -367,7 +484,9 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
 
     with gr.Column(elem_id="main-wrap"):
 
-        # --- Page 0: password gate ---
+        user_school_state = gr.State(None)
+
+        # --- Page 0: Password Gate ---
         with gr.Column(visible=True) as password_page:
             gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
             gr.Markdown("### נא להזין סיסמה כדי להיכנס", rtl=True)
@@ -379,17 +498,9 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             password_error = gr.Markdown("", rtl=True)
             password_submit_btn = gr.Button("כניסה", variant="primary")
 
-        # --- Page 1: role selection ---
-        with gr.Column(visible=False, elem_id="role-page") as role_page:
-            gr.Markdown("# מורה פרטי לפיזיקה - בגרות", rtl=True)
-            gr.Markdown("## מי אתה?", rtl=True)
-            with gr.Row():
-                student_btn = gr.Button("👨‍🎓 אני תלמיד/ה", variant="primary", size="lg", elem_classes="role-btn")
-                teacher_btn = gr.Button("👩‍🏫 אני מורה", variant="secondary", size="lg", elem_classes="role-btn")
-
-        # --- Page 2: student chat interface ---
+        # --- Page 1: Student Chat Interface ---
         with gr.Column(visible=False) as student_page:
-            student_back_btn = gr.Button("⬅ חזרה", size="sm")
+            student_back_btn = gr.Button("⬅ חזרה", size="lg")
             gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
 
             session_state = gr.State(None)
@@ -415,14 +526,21 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
 
             msg_box.submit(
                 fn=handle_message,
-                inputs=[msg_box, chatbot, session_state],
+                inputs=[msg_box, chatbot, session_state, user_school_state],
                 outputs=[chatbot, msg_box, session_state],
             )
 
-        # --- Page 3: teacher dashboard ---
+        # --- Page 2: Teacher Dashboard ---
         with gr.Column(visible=False) as teacher_page:
             teacher_back_btn = gr.Button("⬅ חזרה", size="lg")
             gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
+
+            scope_radio = gr.Radio(
+                label="טווח הנתונים",
+                choices=[SCOPE_MY_SCHOOL, SCOPE_ALL_SCHOOLS],
+                value=SCOPE_MY_SCHOOL,
+                rtl=True,
+            )
 
             refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
 
@@ -459,25 +577,23 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
                 ],
             )
 
-            def refresh_stats():
-                rows = get_topic_stats()
-                import pandas as pd
-                df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
-                max_count = df["מספר שאלות"].max() if not df.empty else 0
-                upper = max(int(max_count * 1.2), 5)
-                plot_update = gr.BarPlot(
-                    x="נושא",
-                    y="מספר שאלות",
-                    title="התפלגות שאלות לפי נושא",
-                    y_lim=(0, upper),
-                    value=df,
-                )
-                return df, plot_update
+            # Auto-refresh whenever the radio toggle changes.
+            # NOTE: queue=False was removed here — with it set, rapid toggles fired
+            # unserialized concurrent requests, and a slower query could resolve
+            # after a faster one, overwriting the dashboard with stale/mismatched
+            # data (table and chart could end up showing different scopes).
+            # Using the default queue keeps requests serialized in order.
+            scope_radio.change(
+                fn=auto_refresh_dashboard,
+                inputs=[scope_radio, user_school_state],
+                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view],
+            )
 
+            # Manual refresh button
             refresh_btn.click(
-                fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
-            ).then(
-                fn=refresh_sessions, inputs=None, outputs=[sessions_dropdown, dialog_view]
+                fn=auto_refresh_dashboard,
+                inputs=[scope_radio, user_school_state],
+                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view],
             )
 
             sessions_dropdown.change(
@@ -486,41 +602,32 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
                 outputs=[dialog_view],
             )
 
-        # --- Navigation wiring ---
-        def check_password(entered_password):
-            if entered_password == APP_PASSWORD:
-                return gr.update(visible=False), gr.update(visible=True), ""
-            return gr.update(visible=True), gr.update(visible=False), "**סיסמה שגויה, נסה/י שוב.**"
-
-        def go_to_student():
-            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-
-        def go_to_teacher():
-            return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
-
-        def go_to_role():
-            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
-
+        # --- Navigation Wiring ---
         password_submit_btn.click(
-            fn=check_password,
-            inputs=[password_box],
-            outputs=[password_page, role_page, password_error],
-        )
-        password_box.submit(
-            fn=check_password,
-            inputs=[password_box],
-            outputs=[password_page, role_page, password_error],
+            fn=check_password_and_load,
+            inputs=[password_box, scope_radio],
+            outputs=[
+                password_page, student_page, teacher_page, 
+                password_error, user_school_state,
+                stats_table, stats_plot, sessions_dropdown, dialog_view
+            ],
         )
 
-        student_btn.click(fn=go_to_student, inputs=None, outputs=[role_page, student_page, teacher_page])
-        teacher_btn.click(
-            fn=go_to_teacher, inputs=None, outputs=[role_page, student_page, teacher_page]
-        ).then(
-            fn=refresh_stats, inputs=None, outputs=[stats_table, stats_plot]
-        ).then(
-            fn=refresh_sessions, inputs=None, outputs=[sessions_dropdown, dialog_view]
+        password_box.submit(
+            fn=check_password_and_load,
+            inputs=[password_box, scope_radio],
+            outputs=[
+                password_page, student_page, teacher_page, 
+                password_error, user_school_state,
+                stats_table, stats_plot, sessions_dropdown, dialog_view
+            ],
         )
-        student_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
-        teacher_back_btn.click(fn=go_to_role, inputs=None, outputs=[role_page, student_page, teacher_page])
+
+        student_back_btn.click(
+            fn=go_to_login, inputs=None, outputs=[password_page, student_page, teacher_page, user_school_state]
+        )
+        teacher_back_btn.click(
+            fn=go_to_login, inputs=None, outputs=[password_page, student_page, teacher_page, user_school_state]
+        )
 
 demo.launch(css=CUSTOM_CSS)
