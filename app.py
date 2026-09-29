@@ -104,7 +104,33 @@ FORMAT REQUIREMENT:
 Respond in EXACTLY this format, nothing else:
 PHYSICS: yes or no
 TOPIC: <one topic from the list above, or N/A if PHYSICS is no>
-DESCRIPTION: <one sentence describing what's in the image>
+DESCRIPTION: <one sentence IN HEBREW describing what's in the image, so a teacher can tell what the question was about without seeing the picture>
+"""
+
+# Text-only counterpart to CLASSIFY_PROMPT, used when a student types a
+# question with no image attached. Same fixed topic list and output format,
+# but judges the typed Hebrew/English/Arabic text itself instead of looking
+# for visual signals.
+TEXT_CLASSIFY_PROMPT = """The following is a message a student typed, with no image attached. Your ONLY job is to decide: is this a high-school (Israeli Bagrut, 5-unit) physics question? Do not solve it.
+CRITICAL DISQUALIFIERS (Instant "PHYSICS: no"):
+- Small talk, greetings, or anything that isn't a physics problem statement or a specific physics concept question.
+- Pure math problems with no physical quantities, forces, or motion context.
+- Questions about other school subjects.
+ISRAELI HIGH-SCHOOL PHYSICS SCOPE:
+The question MUST belong to one of these Bagrut (5-unit) topics:
+1. Mechanics: Kinematics, Newton's Laws, Work & Energy, Momentum & Impulse, Circular Motion, Universal Gravitation & Kepler's Laws, Simple Harmonic Motion, Torque & Static Equilibrium.
+2. Electromagnetism: Electrostatics, DC Circuits, Magnetism.
+3. Optics & Waves: Geometric optics or wave/sound properties.
+TOPIC CLASSIFICATION (only if PHYSICS is yes):
+Choose exactly ONE topic from this fixed list that best matches the question:
+Kinematics, Newton's Laws, Work and Energy, Momentum and Impulse, Circular Motion, Gravitation and Kepler's Laws, Simple Harmonic Motion, Torque and Equilibrium, Electrostatics, DC Circuits, Magnetism, Geometric Optics, Waves and Sound.
+FORMAT REQUIREMENT:
+Respond in EXACTLY this format, nothing else:
+PHYSICS: yes or no
+TOPIC: <one topic from the list above, or N/A if PHYSICS is no>
+DESCRIPTION: <one sentence IN HEBREW summarizing the question, so a teacher can tell what it was about at a glance>
+
+Student's message:
 """
 
 SOCRATIC_SYSTEM_PROMPT = """You are an encouraging, highly expert high school physics private tutor for Israeli students.
@@ -180,14 +206,9 @@ def log_conversation_turn(session_id: str, topic: str, role: str, message: str, 
         print(f"[BigQuery] Conversation insert failed: {e}")
 
 
-def gemini_classify(image_part) -> dict:
-    if not client:
-        raise ValueError("GEMINI_API_KEY environment variable is missing.")
-    result = client.models.generate_content(
-        model=CLASSIFY_MODEL,
-        contents=[image_part, CLASSIFY_PROMPT],
-    )
-    raw_text = result.text
+def _parse_classification(raw_text: str) -> dict:
+    """Shared PHYSICS/TOPIC/DESCRIPTION line parser for both the image and
+    text classifiers below — same output format, different prompt/input."""
     parsed = {"physics": False, "topic": "N/A", "description": ""}
     for line in raw_text.splitlines():
         line = line.strip()
@@ -200,6 +221,50 @@ def gemini_classify(image_part) -> dict:
     if parsed["topic"] not in TOPIC_OPTIONS:
         parsed["topic"] = "Uncategorized"
     return parsed
+
+
+def gemini_classify(image_part) -> dict:
+    if not client:
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
+    result = client.models.generate_content(
+        model=CLASSIFY_MODEL,
+        contents=[image_part, CLASSIFY_PROMPT],
+    )
+    return _parse_classification(result.text)
+
+
+def gemini_classify_text(text: str) -> dict:
+    """Same as gemini_classify, but for a student's typed question with no
+    image attached — lets a session start from text alone."""
+    if not client:
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
+    result = client.models.generate_content(
+        model=CLASSIFY_MODEL,
+        contents=[TEXT_CLASSIFY_PROMPT + text],
+    )
+    return _parse_classification(result.text)
+
+
+def start_tutoring_session(topic, opening_content, logged_opening, user_school):
+    """Creates a new Gemini chat session, sends the opening turn, logs both
+    sides of it to BigQuery, and returns (reply, session_state). Shared by
+    the image-upload path and the text-only path in handle_message so a new
+    session is created identically either way."""
+    chat_session = client.chats.create(
+        model=SOLVE_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=SOCRATIC_SYSTEM_PROMPT,
+            temperature=0.3,
+            max_output_tokens=500,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    session_id = str(uuid.uuid4())
+    log_conversation_turn(session_id, topic, "user", logged_opening, user_school)
+    result = chat_session.send_message(opening_content)
+    reply = result.text
+    log_conversation_turn(session_id, topic, "assistant", reply, user_school)
+    return reply, {"chat": chat_session, "session_id": session_id, "topic": topic}
 
 
 def get_topic_stats(school_filter=None):
@@ -232,6 +297,71 @@ def get_topic_stats(school_filter=None):
     except Exception as e:
         print(f"[BigQuery] Stats query failed: {e}")
         return None
+
+
+def get_top_questions(school_filter=None, limit=5):
+    """Returns up to `limit` (description, count) pairs for questions whose
+    description text was logged more than once, ordered most-repeated first.
+    Grouping is on exact description string — Gemini's classifier phrasing
+    is fairly consistent turn-to-turn, so near-duplicate problems tend to
+    collapse into the same string in practice."""
+    if bq_client is None:
+        return []
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    where_clause = "WHERE school = @school" if school_filter else ""
+    query = f"""
+        SELECT description, COUNT(*) AS count
+        FROM `{table_id}`
+        {where_clause}
+        GROUP BY description
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC
+        LIMIT {limit}
+    """
+    job_config = None
+    if school_filter:
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("school", "STRING", school_filter)]
+        )
+    try:
+        results = bq_client.query(query, job_config=job_config).result()
+        return [(r.description, int(r.count)) for r in results]
+    except Exception as e:
+        print(f"[BigQuery] Top questions query failed: {e}")
+        return []
+
+
+def build_summary_markdown(counts, top_questions):
+    """Builds the Hebrew summary panel text from already-fetched stats.
+    Takes `counts` (from get_topic_stats) and `top_questions` (from
+    get_top_questions) rather than querying again, so the side panel always
+    reflects the exact same scope/data as the table and chart next to it."""
+    if counts is None:
+        return "**לא ניתן לטעון נתונים כרגע.**"
+
+    total = sum(counts.values())
+    if total == 0:
+        return "### 📊 סיכום מהיר\n\n_עדיין לא נרשמו שאלות._"
+
+    top_topic_en = max(counts, key=counts.get)
+    top_topic_he = TOPIC_HEBREW.get(top_topic_en, top_topic_en)
+    top_topic_count = counts[top_topic_en]
+
+    lines = [
+        "### 📊 סיכום מהיר",
+        f"**סה\"כ שאלות שנרשמו:** {total}",
+        f"**הנושא הנפוץ ביותר:** {top_topic_he} ({top_topic_count})",
+        "",
+        "**שאלות שחוזרות על עצמן:**",
+    ]
+
+    if top_questions:
+        for desc, count in top_questions:
+            lines.append(f"- {desc} — **{count}** פעמים")
+    else:
+        lines.append("_אין עדיין שאלות שחוזרות על עצמן._")
+
+    return "\n\n".join(lines)
 
 
 def get_sessions_list(school_filter=None):
@@ -301,6 +431,8 @@ def auto_refresh_dashboard(scope, user_school):
         school_filter = user_school
 
     counts = get_topic_stats(school_filter)
+    top_questions = get_top_questions(school_filter)
+    summary_markdown = build_summary_markdown(counts, top_questions)
 
     if counts is None:
         df = pd.DataFrame({"נושא": [], "מספר שאלות": []})
@@ -340,7 +472,7 @@ def auto_refresh_dashboard(scope, user_school):
     dropdown_update = gr.update(choices=choices, value=None)
     dialog_update = []
 
-    return df, plot_update, dropdown_update, dialog_update
+    return df, plot_update, dropdown_update, dialog_update, summary_markdown
 
 
 # --- LOGIN AND ATOMIC LOAD ---
@@ -355,7 +487,7 @@ def check_password_and_load(entered_password, scope):
             gr.update(visible=False),
             "**סיסמה שגויה, נסה/י שוב.**",
             None,
-            gr.update(), gr.update(), gr.update(), gr.update()
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
         )
 
     school = entry["school"]
@@ -367,11 +499,11 @@ def check_password_and_load(entered_password, scope):
             gr.update(visible=False),
             "",
             school,
-            gr.update(), gr.update(), gr.update(), gr.update()
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
         )
 
     # Teacher login: fetch and return refreshed dashboard components directly
-    df, plot_update, dropdown_update, dialog_update = auto_refresh_dashboard(scope, school)
+    df, plot_update, dropdown_update, dialog_update, summary_markdown = auto_refresh_dashboard(scope, school)
 
     return (
         gr.update(visible=False),
@@ -379,7 +511,7 @@ def check_password_and_load(entered_password, scope):
         gr.update(visible=True),
         "",
         school,
-        df, plot_update, dropdown_update, dialog_update
+        df, plot_update, dropdown_update, dialog_update, summary_markdown
     )
 
 
@@ -411,40 +543,36 @@ def handle_message(message, history, session_state, user_school):
         if not classification["physics"]:
             history.append({
                 "role": "assistant",
-                "content": f"**זו לא נראית שאלת פיזיקה לבגרות.**\n\nתיאור: {classification['description']}"
+                "content": "**זו לא נראית שאלת פיזיקה לבגרות.**"
             })
             return history, clear_value, session_state
 
         topic = classification["topic"]
-        session_id = str(uuid.uuid4())
         log_question_to_bigquery(topic, classification["description"], user_school)
 
         if not client:
             history.append({"role": "assistant", "content": "שגיאה: GEMINI_API_KEY אינו מוגדר."})
             return history, clear_value, session_state
 
-        chat_session = client.chats.create(
-            model=SOLVE_MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=SOCRATIC_SYSTEM_PROMPT,
-                temperature=0.3,
-                max_output_tokens=500,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-
         opening_message = text if text else "שלום, אני צריך עזרה להתחיל לפתור את השאלה הזו."
-        log_conversation_turn(session_id, topic, "user", opening_message, user_school)
+
+        # What gets logged/shown in the teacher's transcript viewer: if the
+        # student typed something alongside the image, that text is already
+        # the clearest signal of what the question is — show it as-is, no
+        # need for Gemini's own description too. Only fall back to the
+        # classifier's Hebrew description when the image came in with no
+        # text at all (there's nothing else to show in its place).
+        logged_opening = text if text else f"📷 {classification['description']}"
+
         try:
-            result = chat_session.send_message([image_part, opening_message])
-            reply = result.text
+            reply, session_state = start_tutoring_session(
+                topic, [image_part, opening_message], logged_opening, user_school
+            )
         except Exception as e:
             history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
             return history, clear_value, session_state
 
-        log_conversation_turn(session_id, topic, "assistant", reply, user_school)
         history.append({"role": "assistant", "content": reply})
-        session_state = {"chat": chat_session, "session_id": session_id, "topic": topic}
         return history, clear_value, session_state
 
     if not text:
@@ -453,10 +581,35 @@ def handle_message(message, history, session_state, user_school):
     history.append({"role": "user", "content": text})
 
     if session_state is None:
-        history.append({
-            "role": "assistant",
-            "content": "כדי להתחיל, צריך להעלות תמונה של שאלת פיזיקה 📎"
-        })
+        # No image attached — start a new session straight from the typed
+        # question, using the text classifier instead of the image one.
+        try:
+            classification = gemini_classify_text(text)
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"שגיאה בסיווג השאלה: {str(e)}"})
+            return history, clear_value, session_state
+
+        if not classification["physics"]:
+            history.append({
+                "role": "assistant",
+                "content": "**זו לא נראית שאלת פיזיקה לבגרות.**"
+            })
+            return history, clear_value, session_state
+
+        topic = classification["topic"]
+        log_question_to_bigquery(topic, classification["description"], user_school)
+
+        if not client:
+            history.append({"role": "assistant", "content": "שגיאה: GEMINI_API_KEY אינו מוגדר."})
+            return history, clear_value, session_state
+
+        try:
+            reply, session_state = start_tutoring_session(topic, text, text, user_school)
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
+            return history, clear_value, session_state
+
+        history.append({"role": "assistant", "content": reply})
         return history, clear_value, session_state
 
     chat_session = session_state["chat"]
@@ -478,11 +631,19 @@ CUSTOM_CSS = """
     max-width: 700px !important;
     margin: 40px auto !important;
 }
+#teacher-wrap {
+    max-width: 1000px !important;
+}
+#summary-panel {
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 10px;
+    padding: 16px;
+}
 """
 
 with gr.Blocks(title="Bagrut Physics Tutor") as demo:
 
-    with gr.Column(elem_id="main-wrap"):
+    with gr.Column(elem_id="main-wrap") as main_wrap:
 
         user_school_state = gr.State(None)
 
@@ -531,7 +692,9 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             )
 
         # --- Page 2: Teacher Dashboard ---
-        with gr.Column(visible=False) as teacher_page:
+        # Widened via #teacher-wrap so the summary side panel has room
+        # alongside the table/chart instead of squeezing the 700px chat width.
+        with gr.Column(visible=False, elem_id="teacher-wrap") as teacher_page:
             teacher_back_btn = gr.Button("⬅ חזרה", size="lg")
             gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
 
@@ -544,20 +707,32 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
 
             refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
 
-            stats_table = gr.Dataframe(
-                headers=["נושא", "מספר שאלות"],
-                datatype=["str", "number"],
-                row_count=(0, "dynamic"),
-                column_count=(2, "fixed"),
-                interactive=False,
-            )
+            # Summary panel placed as the FIRST column so it renders on the
+            # right in the page's left-to-right flex order — the natural
+            # starting point for RTL (Hebrew) reading. Swap the order of
+            # these two `with gr.Column(...)` blocks to move it to the left.
+            with gr.Row():
+                with gr.Column(scale=1, elem_id="summary-panel"):
+                    summary_panel = gr.Markdown(
+                        build_summary_markdown(None, []),
+                        rtl=True,
+                    )
 
-            stats_plot = gr.BarPlot(
-                x="נושא",
-                y="מספר שאלות",
-                title="התפלגות שאלות לפי נושא",
-                y_lim=(0, 10),
-            )
+                with gr.Column(scale=2):
+                    stats_table = gr.Dataframe(
+                        headers=["נושא", "מספר שאלות"],
+                        datatype=["str", "number"],
+                        row_count=(0, "dynamic"),
+                        column_count=(2, "fixed"),
+                        interactive=False,
+                    )
+
+                    stats_plot = gr.BarPlot(
+                        x="נושא",
+                        y="מספר שאלות",
+                        title="התפלגות שאלות לפי נושא",
+                        y_lim=(0, 10),
+                    )
 
             gr.Markdown("### שיחות תלמידים", rtl=True)
 
@@ -586,14 +761,14 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             scope_radio.change(
                 fn=auto_refresh_dashboard,
                 inputs=[scope_radio, user_school_state],
-                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view],
+                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel],
             )
 
             # Manual refresh button
             refresh_btn.click(
                 fn=auto_refresh_dashboard,
                 inputs=[scope_radio, user_school_state],
-                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view],
+                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel],
             )
 
             sessions_dropdown.change(
@@ -609,7 +784,7 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             outputs=[
                 password_page, student_page, teacher_page, 
                 password_error, user_school_state,
-                stats_table, stats_plot, sessions_dropdown, dialog_view
+                stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel
             ],
         )
 
@@ -619,7 +794,7 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             outputs=[
                 password_page, student_page, teacher_page, 
                 password_error, user_school_state,
-                stats_table, stats_plot, sessions_dropdown, dialog_view
+                stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel
             ],
         )
 
