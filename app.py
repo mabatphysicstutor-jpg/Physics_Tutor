@@ -4,6 +4,7 @@ import uuid
 import mimetypes
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+import teacher_qa
 
 import gradio as gr
 import pandas as pd
@@ -156,6 +157,9 @@ try:
 except Exception as e:
     print(f"[BigQuery] Client init failed, question logging disabled: {e}")
     bq_client = None
+
+# --- TEACHER Q&A AGENT SETUP ---
+teacher_qa.init(bq_client, client, model=SOLVE_MODEL)
 
 
 # --- HELPER FUNCTIONS ---
@@ -436,8 +440,6 @@ def auto_refresh_dashboard(scope, user_school):
 
     if counts is None:
         df = pd.DataFrame({"נושא": [], "מספר שאלות": []})
-        upper = 5
-        hebrew_order = []
     else:
         # Fixed, deterministic topic order — identical on every render,
         # regardless of scope or which topics currently have zero questions.
@@ -452,27 +454,12 @@ def auto_refresh_dashboard(scope, user_school):
         rows = [[TOPIC_HEBREW.get(t, t), counts.get(t, 0)] for t in ordered_topics]
         df = pd.DataFrame(rows, columns=["נושא", "מספר שאלות"])
         df["מספר שאלות"] = pd.to_numeric(df["מספר שאלות"], errors="coerce").fillna(0).astype(int)
-        max_count = df["מספר שאלות"].max() if not df.empty else 0
-        upper = max(int(max_count * 1.2), 5)
-        hebrew_order = df["נושא"].tolist()
-
-    plot_update = gr.BarPlot(
-        value=df,
-        x="נושא",
-        y="מספר שאלות",
-        title="התפלגות שאלות לפי נושא",
-        y_lim=(0, upper),
-        # Pin the x-axis to our fixed order explicitly — without this,
-        # Vega-Lite is free to re-sort a nominal axis on its own, which is
-        # what let the bars and labels drift out of sync between scopes.
-        sort=hebrew_order if hebrew_order else None,
-    )
 
     choices = get_sessions_list(school_filter)
     dropdown_update = gr.update(choices=choices, value=None)
     dialog_update = []
 
-    return df, plot_update, dropdown_update, dialog_update, summary_markdown
+    return df, dropdown_update, dialog_update, summary_markdown
 
 
 # --- LOGIN AND ATOMIC LOAD ---
@@ -487,7 +474,7 @@ def check_password_and_load(entered_password, scope):
             gr.update(visible=False),
             "**סיסמה שגויה, נסה/י שוב.**",
             None,
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            gr.update(), gr.update(), gr.update(), gr.update()
         )
 
     school = entry["school"]
@@ -499,11 +486,11 @@ def check_password_and_load(entered_password, scope):
             gr.update(visible=False),
             "",
             school,
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            gr.update(), gr.update(), gr.update(), gr.update()
         )
 
     # Teacher login: fetch and return refreshed dashboard components directly
-    df, plot_update, dropdown_update, dialog_update, summary_markdown = auto_refresh_dashboard(scope, school)
+    df, dropdown_update, dialog_update, summary_markdown = auto_refresh_dashboard(scope, school)
 
     return (
         gr.update(visible=False),
@@ -511,7 +498,7 @@ def check_password_and_load(entered_password, scope):
         gr.update(visible=True),
         "",
         school,
-        df, plot_update, dropdown_update, dialog_update, summary_markdown
+        df, dropdown_update, dialog_update, summary_markdown
     )
 
 
@@ -625,65 +612,332 @@ def handle_message(message, history, session_state, user_school):
     return history, clear_value, session_state
 
 
+# --- TEACHER Q&A CHAT ---
+def teacher_chat(message, history, user_school):
+    """Answers a teacher's question about the logged conversations. Data is
+    national by default; it is limited to the teacher's school only when the
+    teacher asks for that in the question itself."""
+    history = history or []
+    message = (message or "").strip()
+    if not message:
+        return history, ""
+    try:
+        reply = teacher_qa.answer(message, history, user_school)
+    except Exception as e:
+        reply = f"שגיאה: {str(e)}"
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": reply})
+    return history, ""
+
+
 # --- UI CONSTRUCTION ---
 CUSTOM_CSS = """
-#main-wrap {
-    max-width: 700px !important;
-    margin: 40px auto !important;
+@import url('https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap');
+
+/* ---------- Global ---------- */
+.gradio-container {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: 0 !important;
+    font-family: 'Heebo', system-ui, -apple-system, 'Segoe UI', sans-serif !important;
 }
-#teacher-wrap {
-    max-width: 1000px !important;
+footer { display: none !important; }
+#main-wrap {
+    max-width: none !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    gap: 0 !important;
+}
+
+/* Big, clear back button (student + teacher) */
+.back-btn {
+    min-height: 50px !important;
+    min-width: 140px !important;
+    font-size: 1.1rem !important;
+    font-weight: 600 !important;
+    border-radius: 999px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    background: var(--background-fill-primary) !important;
+    color: var(--body-text-color) !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06) !important;
+}
+
+/* ---------- Login ---------- */
+#login-card {
+    max-width: 520px !important;
+    margin: 12vh auto 0 auto !important;
+    padding: 40px 36px !important;
+    gap: 18px !important;
+    border-radius: 24px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    background: var(--background-fill-primary) !important;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.08);
+}
+.login-title {
+    font-size: 1.8rem;
+    font-weight: 700;
+    text-align: center;
+    direction: rtl;
+}
+.login-sub {
+    font-size: 1.1rem;
+    text-align: center;
+    direction: rtl;
+    margin-top: 6px;
+    color: var(--body-text-color-subdued);
+}
+#password-box input {
+    height: 62px !important;
+    font-size: 1.3rem !important;
+    padding: 0 20px !important;
+    text-align: right;
+    border-radius: 14px !important;
+    border: 1.5px solid var(--border-color-primary) !important;
+    background: var(--background-fill-secondary) !important;
+}
+#password-box input::placeholder { font-size: 1.15rem; }
+/* no spinner / stepper arrows on the input */
+#password-box input::-webkit-inner-spin-button,
+#password-box input::-webkit-outer-spin-button {
+    -webkit-appearance: none !important;
+    display: none !important;
+    margin: 0;
+}
+#password-box input[type=number] { -moz-appearance: textfield; }
+#login-error p { font-size: 1.05rem; text-align: center; }
+#login-btn {
+    min-height: 60px !important;
+    font-size: 1.25rem !important;
+    font-weight: 600 !important;
+    border-radius: 14px !important;
+}
+
+/* ---------- Student: classic AI-chat layout ---------- */
+#student-page {
+    max-width: 820px !important;
+    width: 100% !important;
+    margin: 0 auto !important;
+    padding: 0 16px !important;
+    gap: 0 !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    overflow: hidden !important;
+}
+#student-topbar {
+    align-items: center !important;
+    padding: 14px 0 !important;
+    gap: 12px !important;
+    flex-wrap: nowrap !important;
+    border: none !important;
+}
+#student-title p, #student-title {
+    font-weight: 600 !important;
+    font-size: 1.2rem !important;
+    margin: 0 !important;
+}
+
+/* chat area: no frame, no label, assistant text flows on the page */
+#student-chat {
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+}
+#student-chat .bubble-wrap,
+#student-chat .wrapper {
+    background: transparent !important;
+    border: none !important;
+}
+#student-chat .message.bot,
+#student-chat .bot.message {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding-inline: 0 !important;
+    font-size: 1.02rem;
+    line-height: 1.75;
+    max-width: 100% !important;
+}
+#student-chat .message.user,
+#student-chat .user.message {
+    background: var(--background-fill-secondary) !important;
+    border: none !important;
+    border-radius: 22px !important;
+    padding: 10px 18px !important;
+    max-width: 80% !important;
+    font-size: 1.02rem;
+    line-height: 1.6;
+}
+#student-chat .placeholder-content,
+#student-chat .placeholder {
+    text-align: center;
+}
+
+/* input dock pinned to the bottom, pill-shaped */
+#input-dock {
+    position: sticky;
+    bottom: 0;
+    z-index: 20;
+    background: var(--body-background-fill);
+    padding: 8px 0 10px 0 !important;
+    border: none !important;
+}
+#student-input {
+    border-radius: 28px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    background: var(--background-fill-primary) !important;
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.08) !important;
+    padding: 6px 10px !important;
+}
+#student-input textarea {
+    font-size: 1rem !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+#input-hint {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--body-text-color-subdued);
+    margin-top: 6px;
+}
+
+/* ---------- Teacher: full-width dashboard ---------- */
+#teacher-page {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 28px 40px 28px !important;
+    gap: 18px !important;
+}
+#teacher-topbar {
+    align-items: center !important;
+    gap: 16px !important;
+    padding: 16px 0 !important;
+    border-bottom: 1px solid var(--border-color-primary);
+}
+#teacher-title p, #teacher-title {
+    font-size: 1.4rem !important;
+    font-weight: 700 !important;
+    margin: 0 !important;
 }
 #summary-panel {
-    background: rgba(0, 0, 0, 0.03);
-    border-radius: 10px;
-    padding: 16px;
+    background: var(--background-fill-secondary);
+    border-radius: 16px;
+    padding: 20px !important;
+    min-width: 240px !important;
+}
+.panel-title p, .panel-title {
+    font-size: 1.15rem !important;
+    font-weight: 600 !important;
+    margin: 0 0 4px 0 !important;
+}
+
+/* Teacher chats: our own fixed-height box that always scrolls.
+   The chatbot inside is allowed to grow to the full length of the answer. */
+#teacher-chat-scroll, #dialog-scroll {
+    height: calc(100dvh - 360px) !important;
+    min-height: 240px !important;
+    max-height: calc(100dvh - 360px) !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    display: block !important;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 16px !important;
+    padding: 4px !important;
+}
+#teacher-chat-box, #dialog-box,
+#teacher-chat-box .wrapper, #dialog-box .wrapper,
+#teacher-chat-box .bubble-wrap, #dialog-box .bubble-wrap {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border: none !important;
+}
+#teacher-chat-box .message,
+#dialog-box .message {
+    max-width: 100% !important;
 }
 """
 
-with gr.Blocks(title="Bagrut Physics Tutor") as demo:
+THEME = gr.themes.Base(
+    primary_hue="indigo",
+    neutral_hue="slate",
+    radius_size=gr.themes.sizes.radius_lg,
+    font=[gr.themes.GoogleFont("Heebo"), "system-ui", "sans-serif"],
+)
+
+LATEX = [
+    {"left": "$$", "right": "$$", "display": True},
+    {"left": "$", "right": "$", "display": False},
+]
+
+with gr.Blocks(title="Bagrut Physics Tutor", fill_width=True) as demo:
 
     with gr.Column(elem_id="main-wrap") as main_wrap:
 
         user_school_state = gr.State(None)
 
         # --- Page 0: Password Gate ---
-        with gr.Column(visible=True) as password_page:
-            gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
-            gr.Markdown("### נא להזין סיסמה כדי להיכנס", rtl=True)
+        with gr.Column(visible=True, elem_id="login-card") as password_page:
+            gr.HTML(
+                "<div class='login-title'>מורה פרטי לפיזיקה - בגרות</div>"
+                "<div class='login-sub'>נא להזין סיסמה כדי להיכנס</div>"
+            )
             password_box = gr.Textbox(
-                label="סיסמה",
+                show_label=False,
+                container=False,
+                placeholder="הקלידו סיסמה",
                 type="password",
                 rtl=True,
+                elem_id="password-box",
             )
-            password_error = gr.Markdown("", rtl=True)
-            password_submit_btn = gr.Button("כניסה", variant="primary")
+            password_error = gr.Markdown("", rtl=True, elem_id="login-error")
+            password_submit_btn = gr.Button("כניסה", variant="primary", size="lg", elem_id="login-btn")
 
-        # --- Page 1: Student Chat Interface ---
-        with gr.Column(visible=False) as student_page:
-            student_back_btn = gr.Button("⬅ חזרה", size="lg")
-            gr.Markdown("## מורה פרטי לפיזיקה - בגרות", rtl=True)
+        # --- Page 1: Student Chat Interface (ChatGPT / Claude / Gemini style) ---
+        with gr.Column(visible=False, elem_id="student-page") as student_page:
+            with gr.Row(elem_id="student-topbar"):
+                student_back_btn = gr.Button(
+                    "⬅ חזרה", size="lg", scale=0, min_width=140, elem_classes=["back-btn"]
+                )
+                gr.Markdown("מורה פרטי לפיזיקה", rtl=True, elem_id="student-title")
 
             session_state = gr.State(None)
 
             chatbot = gr.Chatbot(
-                label="Tutor",
+                show_label=False,
                 rtl=True,
                 sanitize_html=False,
-                height=500,
-                latex_delimiters=[
-                    {"left": "$$", "right": "$$", "display": True},
-                    {"left": "$", "right": "$", "display": False},
-                ],
+                height="calc(100dvh - 280px)",
+                autoscroll=True,
+                layout="bubble",
+                elem_id="student-chat",
+                placeholder=(
+                    "## שלום 👋\n\n"
+                    "### באיזו שאלה בפיזיקה נתחיל היום?\n\n"
+                    "כתבו את השאלה או צרפו תמונה שלה, ואלווה אתכם צעד אחר צעד."
+                ),
+                latex_delimiters=LATEX,
             )
 
-            msg_box = gr.MultimodalTextbox(
-                label="",
-                placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
-                file_types=["image"],
-                sources=["upload"],
-                rtl=True,
-            )
+            with gr.Column(elem_id="input-dock"):
+                msg_box = gr.MultimodalTextbox(
+                    show_label=False,
+                    placeholder="כתבו שאלה או צרפו תמונה של בעיה...",
+                    file_types=["image"],
+                    sources=["upload"],
+                    rtl=True,
+                    lines=1,
+                    max_lines=6,
+                    elem_id="student-input",
+                )
+                gr.Markdown(
+                    "המורה הפרטי מכוון אתכם בשאלות ולא פותר במקומכם. כדאי לבדוק תשובות חשובות.",
+                    elem_id="input-hint",
+                    rtl=True,
+                )
 
             msg_box.submit(
                 fn=handle_message,
@@ -691,84 +945,102 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
                 outputs=[chatbot, msg_box, session_state],
             )
 
-        # --- Page 2: Teacher Dashboard ---
-        # Widened via #teacher-wrap so the summary side panel has room
-        # alongside the table/chart instead of squeezing the 700px chat width.
-        with gr.Column(visible=False, elem_id="teacher-wrap") as teacher_page:
-            teacher_back_btn = gr.Button("⬅ חזרה", size="lg")
-            gr.Markdown("## לוח בקרה למורה - סטטיסיקת שאלות", rtl=True)
+        # --- Page 2: Teacher Dashboard (uses the full screen width) ---
+        with gr.Column(visible=False, elem_id="teacher-page") as teacher_page:
 
-            scope_radio = gr.Radio(
-                label="טווח הנתונים",
-                choices=[SCOPE_MY_SCHOOL, SCOPE_ALL_SCHOOLS],
-                value=SCOPE_MY_SCHOOL,
-                rtl=True,
+            # Top bar: back | title | scope | refresh — all on one line
+            with gr.Row(elem_id="teacher-topbar"):
+                teacher_back_btn = gr.Button(
+                    "⬅ חזרה", size="lg", scale=0, min_width=140, elem_classes=["back-btn"]
+                )
+                gr.Markdown("לוח בקרה למורה - סטטיסטיקת שאלות", rtl=True, elem_id="teacher-title", scale=3)
+                scope_radio = gr.Radio(
+                    label="טווח הנתונים",
+                    choices=[SCOPE_MY_SCHOOL, SCOPE_ALL_SCHOOLS],
+                    value=SCOPE_MY_SCHOOL,
+                    rtl=True,
+                    scale=2,
+                )
+                refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary", size="lg", scale=0, min_width=160)
+
+            # Two tabs so each view gets the whole screen height and the
+            # chat boxes always fit inside the window (no page + box double scroll).
+            with gr.Tabs(elem_id="teacher-tabs"):
+
+                with gr.Tab("📊 סטטיסטיקה"):
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1, elem_id="summary-panel"):
+                            summary_panel = gr.Markdown(
+                                build_summary_markdown(None, []),
+                                rtl=True,
+                            )
+
+                        with gr.Column(scale=2):
+                            stats_table = gr.Dataframe(
+                                headers=["נושא", "מספר שאלות"],
+                                datatype=["str", "number"],
+                                row_count=(0, "dynamic"),
+                                column_count=(2, "fixed"),
+                                interactive=False,
+                                max_height=520,
+                            )
+
+                with gr.Tab("💬 שיחות ושאלות"):
+                    # Transcripts on one side, "ask the data" on the other
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("שיחות תלמידים", rtl=True, elem_classes="panel-title")
+                            sessions_dropdown = gr.Dropdown(
+                                label="בחר/י שיחה לצפייה",
+                                choices=[],
+                            )
+                            with gr.Column(elem_id="dialog-scroll"):
+                                dialog_view = gr.Chatbot(
+                                    show_label=False,
+                                    rtl=True,
+                                    height=None,
+                                    autoscroll=False,
+                                    sanitize_html=False,
+                                    elem_id="dialog-box",
+                                    latex_delimiters=LATEX,
+                                )
+
+                        with gr.Column(scale=1):
+                            gr.Markdown("שאל שאלה על השיחות", rtl=True, elem_classes="panel-title")
+                            teacher_q_box = gr.Textbox(
+                                placeholder="למשל: באילו נושאים תלמידים נתקעו הכי הרבה?",
+                                show_label=False,
+                                rtl=True,
+                            )
+                            with gr.Column(elem_id="teacher-chat-scroll"):
+                                teacher_chatbot = gr.Chatbot(
+                                    show_label=False,
+                                    rtl=True,
+                                    height=None,
+                                    autoscroll=False,
+                                    sanitize_html=False,
+                                    elem_id="teacher-chat-box",
+                                    latex_delimiters=LATEX,
+                                )
+
+            teacher_q_box.submit(
+                fn=teacher_chat,
+                inputs=[teacher_q_box, teacher_chatbot, user_school_state],
+                outputs=[teacher_chatbot, teacher_q_box],
             )
 
-            refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary")
-
-            # Summary panel placed as the FIRST column so it renders on the
-            # right in the page's left-to-right flex order — the natural
-            # starting point for RTL (Hebrew) reading. Swap the order of
-            # these two `with gr.Column(...)` blocks to move it to the left.
-            with gr.Row():
-                with gr.Column(scale=1, elem_id="summary-panel"):
-                    summary_panel = gr.Markdown(
-                        build_summary_markdown(None, []),
-                        rtl=True,
-                    )
-
-                with gr.Column(scale=2):
-                    stats_table = gr.Dataframe(
-                        headers=["נושא", "מספר שאלות"],
-                        datatype=["str", "number"],
-                        row_count=(0, "dynamic"),
-                        column_count=(2, "fixed"),
-                        interactive=False,
-                    )
-
-                    stats_plot = gr.BarPlot(
-                        x="נושא",
-                        y="מספר שאלות",
-                        title="התפלגות שאלות לפי נושא",
-                        y_lim=(0, 10),
-                    )
-
-            gr.Markdown("### שיחות תלמידים", rtl=True)
-
-            sessions_dropdown = gr.Dropdown(
-                label="בחר/י שיחה לצפייה",
-                choices=[],
-            )
-
-            dialog_view = gr.Chatbot(
-                label="תמלול השיחה",
-                rtl=True,
-                height=450,
-                sanitize_html=False,
-                latex_delimiters=[
-                    {"left": "$$", "right": "$$", "display": True},
-                    {"left": "$", "right": "$", "display": False},
-                ],
-            )
-
-            # Auto-refresh whenever the radio toggle changes.
-            # NOTE: queue=False was removed here — with it set, rapid toggles fired
-            # unserialized concurrent requests, and a slower query could resolve
-            # after a faster one, overwriting the dashboard with stale/mismatched
-            # data (table and chart could end up showing different scopes).
-            # Using the default queue keeps requests serialized in order.
+            # Auto-refresh whenever the radio toggle changes (default queue keeps
+            # requests serialized so a slow query can't overwrite a newer one).
             scope_radio.change(
                 fn=auto_refresh_dashboard,
                 inputs=[scope_radio, user_school_state],
-                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel],
+                outputs=[stats_table, sessions_dropdown, dialog_view, summary_panel],
             )
 
-            # Manual refresh button
             refresh_btn.click(
                 fn=auto_refresh_dashboard,
                 inputs=[scope_radio, user_school_state],
-                outputs=[stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel],
+                outputs=[stats_table, sessions_dropdown, dialog_view, summary_panel],
             )
 
             sessions_dropdown.change(
@@ -782,9 +1054,9 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             fn=check_password_and_load,
             inputs=[password_box, scope_radio],
             outputs=[
-                password_page, student_page, teacher_page, 
+                password_page, student_page, teacher_page,
                 password_error, user_school_state,
-                stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel
+                stats_table, sessions_dropdown, dialog_view, summary_panel
             ],
         )
 
@@ -792,9 +1064,9 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             fn=check_password_and_load,
             inputs=[password_box, scope_radio],
             outputs=[
-                password_page, student_page, teacher_page, 
+                password_page, student_page, teacher_page,
                 password_error, user_school_state,
-                stats_table, stats_plot, sessions_dropdown, dialog_view, summary_panel
+                stats_table, sessions_dropdown, dialog_view, summary_panel
             ],
         )
 
@@ -805,4 +1077,4 @@ with gr.Blocks(title="Bagrut Physics Tutor") as demo:
             fn=go_to_login, inputs=None, outputs=[password_page, student_page, teacher_page, user_school_state]
         )
 
-demo.launch(css=CUSTOM_CSS)
+demo.launch(css=CUSTOM_CSS, theme=THEME)
