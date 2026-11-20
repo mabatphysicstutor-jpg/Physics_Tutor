@@ -1,6 +1,8 @@
 import os
+import io
 import json
 import uuid
+import base64
 import mimetypes
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -12,6 +14,7 @@ from google import genai
 from google.genai import types
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from PIL import Image, ImageOps
 
 # --- CONFIGURATION ---
 CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "gemini-3.1-flash-lite")
@@ -49,6 +52,12 @@ SCHOOL_HEBREW = {
 
 SCOPE_MY_SCHOOL = "בית הספר שלי"
 SCOPE_ALL_SCHOOLS = "כל בתי הספר"
+# The dashboard (stats table, summary, conversation list) shows this scope.
+# Change to SCOPE_ALL_SCHOOLS to show every school instead.
+DASHBOARD_SCOPE = SCOPE_MY_SCHOOL
+
+VIEW_STATS = "📊  סטטיסטיקה"
+VIEW_CHATS = "💬  שיחות ושאלות"
 
 TOPIC_OPTIONS = [
     "Kinematics",
@@ -190,7 +199,28 @@ def log_question_to_bigquery(topic: str, description: str, school) -> None:
         print(f"[BigQuery] Insert failed: {e}")
 
 
-def log_conversation_turn(session_id: str, topic: str, role: str, message: str, school) -> None:
+def image_to_b64_jpeg(path: str, max_side: int = 1400, quality: int = 80):
+    """Shrinks a student's uploaded image to a JPEG (<~900 KB) and returns it as a
+    base64 string for logging next to the message. Returns None if anything goes
+    wrong, so a bad image never breaks the tutoring flow."""
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            for side, q in ((max_side, quality), (1000, 70), (700, 60)):
+                work = im.copy()
+                work.thumbnail((side, side))
+                buf = io.BytesIO()
+                work.save(buf, format="JPEG", quality=q, optimize=True)
+                data = buf.getvalue()
+                if len(data) <= 900_000:
+                    break
+        return base64.b64encode(data).decode("ascii")
+    except Exception as e:
+        print(f"[Image] Could not prepare image for logging: {e}")
+        return None
+
+
+def log_conversation_turn(session_id: str, topic: str, role: str, message: str, school, image_b64=None) -> None:
     if bq_client is None or not session_id:
         return
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
@@ -202,8 +232,15 @@ def log_conversation_turn(session_id: str, topic: str, role: str, message: str, 
         "school": school,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if image_b64:
+        row["image_data"] = image_b64
     try:
         errors = bq_client.insert_rows_json(table_id, [row])
+        if errors and image_b64:
+            # e.g. the image_data column doesn't exist yet: don't lose the text turn.
+            print(f"[BigQuery] Insert with image failed ({errors}); retrying without the image.")
+            row.pop("image_data", None)
+            errors = bq_client.insert_rows_json(table_id, [row])
         if errors:
             print(f"[BigQuery] Conversation insert returned errors: {errors}")
     except Exception as e:
@@ -249,7 +286,7 @@ def gemini_classify_text(text: str) -> dict:
     return _parse_classification(result.text)
 
 
-def start_tutoring_session(topic, opening_content, logged_opening, user_school):
+def start_tutoring_session(topic, opening_content, logged_opening, user_school, image_b64=None):
     """Creates a new Gemini chat session, sends the opening turn, logs both
     sides of it to BigQuery, and returns (reply, session_state). Shared by
     the image-upload path and the text-only path in handle_message so a new
@@ -264,7 +301,7 @@ def start_tutoring_session(topic, opening_content, logged_opening, user_school):
         ),
     )
     session_id = str(uuid.uuid4())
-    log_conversation_turn(session_id, topic, "user", logged_opening, user_school)
+    log_conversation_turn(session_id, topic, "user", logged_opening, user_school, image_b64=image_b64)
     result = chat_session.send_message(opening_content)
     reply = result.text
     log_conversation_turn(session_id, topic, "assistant", reply, user_school)
@@ -400,22 +437,47 @@ def get_sessions_list(school_filter=None):
         return []
 
 
+def _image_html(image_b64: str) -> str:
+    return (
+        f'<img src="data:image/jpeg;base64,{image_b64}" alt="תמונה שהתלמיד שלח" '
+        'style="display:block;max-width:100%;max-height:380px;border-radius:10px;margin-bottom:10px;" />'
+    )
+
+
 def get_conversation_dialog(session_id):
     if bq_client is None or not session_id:
         return []
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONV_TABLE}"
-    query = f"""
-        SELECT role, message, created_at
-        FROM `{table_id}`
-        WHERE session_id = @session_id
-        ORDER BY created_at ASC
-    """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("session_id", "STRING", session_id)]
     )
+
+    def run(with_image):
+        cols = "role, message, created_at" + (", image_data" if with_image else "")
+        query = f"""
+            SELECT {cols}
+            FROM `{table_id}`
+            WHERE session_id = @session_id
+            ORDER BY created_at ASC
+        """
+        return list(bq_client.query(query, job_config=job_config).result())
+
     try:
-        results = bq_client.query(query, job_config=job_config).result()
-        dialog = [{"role": r.role, "content": r.message} for r in results]
+        try:
+            rows = run(with_image=True)
+            has_images = True
+        except Exception:
+            # image_data column not created yet: fall back to text-only transcripts
+            rows = run(with_image=False)
+            has_images = False
+
+        dialog = []
+        for r in rows:
+            content = r.message or ""
+            image_b64 = getattr(r, "image_data", None) if has_images else None
+            if image_b64:
+                content = _image_html(image_b64) + "\n\n" + content
+            dialog.append({"role": r.role, "content": content})
         return dialog
     except Exception as e:
         print(f"[BigQuery] Dialog query failed: {e}")
@@ -502,6 +564,11 @@ def check_password_and_load(entered_password, scope):
     )
 
 
+def switch_teacher_view(view):
+    """Shows either the statistics view or the conversations/questions view."""
+    return gr.update(visible=(view == VIEW_STATS)), gr.update(visible=(view == VIEW_CHATS))
+
+
 def go_to_login():
     return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), None
 
@@ -553,7 +620,8 @@ def handle_message(message, history, session_state, user_school):
 
         try:
             reply, session_state = start_tutoring_session(
-                topic, [image_part, opening_message], logged_opening, user_school
+                topic, [image_part, opening_message], logged_opening, user_school,
+                image_b64=image_to_b64_jpeg(image_path),
             )
         except Exception as e:
             history.append({"role": "assistant", "content": f"שגיאה בפנייה ל-Gemini: {str(e)}"})
@@ -810,16 +878,84 @@ footer { display: none !important; }
     padding: 0 28px 40px 28px !important;
     gap: 18px !important;
 }
-#teacher-topbar {
+#teacher-header {
     align-items: center !important;
     gap: 16px !important;
-    padding: 16px 0 !important;
-    border-bottom: 1px solid var(--border-color-primary);
+    padding: 18px 0 8px 0 !important;
+    flex-wrap: nowrap !important;
 }
-#teacher-title p, #teacher-title {
-    font-size: 1.4rem !important;
+#teacher-title, #teacher-title p {
+    font-size: 1.7rem !important;
     font-weight: 700 !important;
     margin: 0 !important;
+    text-align: center !important;
+}
+#refresh-btn {
+    min-height: 50px !important;
+    min-width: 160px !important;
+    font-size: 1.05rem !important;
+    font-weight: 600 !important;
+    border-radius: 999px !important;
+}
+
+/* Toolbar: big view switch + compact scope switch, one clean line */
+#teacher-toolbar {
+    align-items: center !important;
+    gap: 24px !important;
+    padding: 8px 0 12px 0 !important;
+    border-bottom: 1px solid var(--border-color-primary);
+    flex-wrap: nowrap !important;
+}
+#view-switch {
+    max-width: 760px !important;
+    margin: 0 auto !important;
+}
+#view-switch, #scope-switch {
+    border: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+}
+#view-switch .wrap, #scope-switch .wrap {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    gap: 6px !important;
+    padding: 6px !important;
+    width: 100% !important;
+    background: var(--background-fill-secondary) !important;
+    border-radius: 18px !important;
+}
+#view-switch label, #scope-switch label {
+    flex: 1 1 0 !important;
+    justify-content: center !important;
+    text-align: center !important;
+    border: none !important;
+    border-radius: 13px !important;
+    background: transparent !important;
+    color: var(--body-text-color-subdued) !important;
+    box-shadow: none !important;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+#view-switch label { font-size: 1.35rem !important; font-weight: 700 !important; padding: 16px 20px !important; }
+#scope-switch label { font-size: 1.05rem !important; font-weight: 600 !important; padding: 12px 14px !important; }
+#view-switch input, #scope-switch input { display: none !important; }
+#view-switch label.selected {
+    background: var(--color-accent) !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 10px rgba(79, 70, 229, 0.35) !important;
+}
+#scope-switch label.selected {
+    background: var(--background-fill-primary) !important;
+    color: var(--body-text-color) !important;
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.14) !important;
+}
+#scope-caption p, #scope-caption {
+    margin: 0 !important;
+    font-size: 0.95rem !important;
+    font-weight: 600 !important;
+    color: var(--body-text-color-subdued) !important;
+    white-space: nowrap;
 }
 #summary-panel {
     background: var(--background-fill-secondary);
@@ -836,9 +972,9 @@ footer { display: none !important; }
 /* Teacher chats: our own fixed-height box that always scrolls.
    The chatbot inside is allowed to grow to the full length of the answer. */
 #teacher-chat-scroll, #dialog-scroll {
-    height: calc(100dvh - 360px) !important;
-    min-height: 240px !important;
-    max-height: calc(100dvh - 360px) !important;
+    height: calc(100dvh - 430px) !important;
+    min-height: 200px !important;
+    max-height: calc(100dvh - 430px) !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
     display: block !important;
@@ -948,93 +1084,99 @@ with gr.Blocks(title="Bagrut Physics Tutor", fill_width=True) as demo:
         # --- Page 2: Teacher Dashboard (uses the full screen width) ---
         with gr.Column(visible=False, elem_id="teacher-page") as teacher_page:
 
-            # Top bar: back | title | scope | refresh — all on one line
-            with gr.Row(elem_id="teacher-topbar"):
+            # Header: back | title | refresh
+            with gr.Row(elem_id="teacher-header"):
                 teacher_back_btn = gr.Button(
                     "⬅ חזרה", size="lg", scale=0, min_width=140, elem_classes=["back-btn"]
                 )
-                gr.Markdown("לוח בקרה למורה - סטטיסטיקת שאלות", rtl=True, elem_id="teacher-title", scale=3)
-                scope_radio = gr.Radio(
-                    label="טווח הנתונים",
-                    choices=[SCOPE_MY_SCHOOL, SCOPE_ALL_SCHOOLS],
-                    value=SCOPE_MY_SCHOOL,
-                    rtl=True,
-                    scale=2,
+                gr.Markdown("לוח בקרה למורה", rtl=True, elem_id="teacher-title", scale=1)
+                refresh_btn = gr.Button(
+                    "🔄 רענון נתונים", variant="primary", size="lg", scale=0, min_width=160,
+                    elem_id="refresh-btn",
                 )
-                refresh_btn = gr.Button("🔄 רענן נתונים", variant="primary", size="lg", scale=0, min_width=160)
 
-            # Two tabs so each view gets the whole screen height and the
-            # chat boxes always fit inside the window (no page + box double scroll).
-            with gr.Tabs(elem_id="teacher-tabs"):
+            # Toolbar: big view switch (stats / conversations) + compact data-scope switch
+            with gr.Row(elem_id="teacher-toolbar"):
+                view_switch = gr.Radio(
+                    choices=[VIEW_STATS, VIEW_CHATS],
+                    value=VIEW_STATS,
+                    show_label=False,
+                    container=False,
+                    rtl=True,
+                    scale=1,
+                    elem_id="view-switch",
+                )
 
-                with gr.Tab("📊 סטטיסטיקה"):
-                    with gr.Row(equal_height=True):
-                        with gr.Column(scale=1, elem_id="summary-panel"):
-                            summary_panel = gr.Markdown(
-                                build_summary_markdown(None, []),
-                                rtl=True,
-                            )
+            # Fixed data scope (no toggle): see DASHBOARD_SCOPE at the top of the file
+            scope_radio = gr.State(DASHBOARD_SCOPE)
 
-                        with gr.Column(scale=2):
-                            stats_table = gr.Dataframe(
-                                headers=["נושא", "מספר שאלות"],
-                                datatype=["str", "number"],
-                                row_count=(0, "dynamic"),
-                                column_count=(2, "fixed"),
-                                interactive=False,
-                                max_height=520,
-                            )
+            # ---------- View 1: statistics ----------
+            with gr.Column(visible=True, elem_id="stats-view") as stats_view:
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=1, elem_id="summary-panel"):
+                        summary_panel = gr.Markdown(
+                            build_summary_markdown(None, []),
+                            rtl=True,
+                        )
 
-                with gr.Tab("💬 שיחות ושאלות"):
-                    # Transcripts on one side, "ask the data" on the other
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            gr.Markdown("שיחות תלמידים", rtl=True, elem_classes="panel-title")
-                            sessions_dropdown = gr.Dropdown(
-                                label="בחר/י שיחה לצפייה",
-                                choices=[],
-                            )
-                            with gr.Column(elem_id="dialog-scroll"):
-                                dialog_view = gr.Chatbot(
-                                    show_label=False,
-                                    rtl=True,
-                                    height=None,
-                                    autoscroll=False,
-                                    sanitize_html=False,
-                                    elem_id="dialog-box",
-                                    latex_delimiters=LATEX,
-                                )
+                    with gr.Column(scale=2):
+                        stats_table = gr.Dataframe(
+                            headers=["נושא", "מספר שאלות"],
+                            datatype=["str", "number"],
+                            row_count=(0, "dynamic"),
+                            column_count=(2, "fixed"),
+                            interactive=False,
+                            max_height=520,
+                        )
 
-                        with gr.Column(scale=1):
-                            gr.Markdown("שאל שאלה על השיחות", rtl=True, elem_classes="panel-title")
-                            teacher_q_box = gr.Textbox(
-                                placeholder="למשל: באילו נושאים תלמידים נתקעו הכי הרבה?",
+            # ---------- View 2: conversations + questions about them ----------
+            with gr.Column(visible=False, elem_id="chats-view") as chats_view:
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("שיחות תלמידים", rtl=True, elem_classes="panel-title")
+                        sessions_dropdown = gr.Dropdown(
+                            label="בחר/י שיחה לצפייה",
+                            choices=[],
+                        )
+                        with gr.Column(elem_id="dialog-scroll"):
+                            dialog_view = gr.Chatbot(
                                 show_label=False,
                                 rtl=True,
+                                height=None,
+                                autoscroll=False,
+                                sanitize_html=False,
+                                elem_id="dialog-box",
+                                latex_delimiters=LATEX,
                             )
-                            with gr.Column(elem_id="teacher-chat-scroll"):
-                                teacher_chatbot = gr.Chatbot(
-                                    show_label=False,
-                                    rtl=True,
-                                    height=None,
-                                    autoscroll=False,
-                                    sanitize_html=False,
-                                    elem_id="teacher-chat-box",
-                                    latex_delimiters=LATEX,
-                                )
+
+                    with gr.Column(scale=1):
+                        gr.Markdown("שאל שאלה על השיחות", rtl=True, elem_classes="panel-title")
+                        teacher_q_box = gr.Textbox(
+                            placeholder="למשל: באילו נושאים תלמידים נתקעו הכי הרבה?",
+                            show_label=False,
+                            rtl=True,
+                        )
+                        with gr.Column(elem_id="teacher-chat-scroll"):
+                            teacher_chatbot = gr.Chatbot(
+                                show_label=False,
+                                rtl=True,
+                                height=None,
+                                autoscroll=False,
+                                sanitize_html=False,
+                                elem_id="teacher-chat-box",
+                                latex_delimiters=LATEX,
+                            )
+
+            view_switch.change(
+                fn=switch_teacher_view,
+                inputs=[view_switch],
+                outputs=[stats_view, chats_view],
+            )
 
             teacher_q_box.submit(
                 fn=teacher_chat,
                 inputs=[teacher_q_box, teacher_chatbot, user_school_state],
                 outputs=[teacher_chatbot, teacher_q_box],
-            )
-
-            # Auto-refresh whenever the radio toggle changes (default queue keeps
-            # requests serialized so a slow query can't overwrite a newer one).
-            scope_radio.change(
-                fn=auto_refresh_dashboard,
-                inputs=[scope_radio, user_school_state],
-                outputs=[stats_table, sessions_dropdown, dialog_view, summary_panel],
             )
 
             refresh_btn.click(
